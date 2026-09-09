@@ -1,70 +1,112 @@
 # Clibo
 
-Windows 本地剪贴板工具，Rust + egui 原生实现，运行不依赖 WebView、Node 或其他运行时。当前版本 **0.4.0 原生预览版**。
+[English](README.en.md) · 中文
 
-架构、macOS 适配、迁移差异与演示开关见 [native/README.md](native/README.md)。0.3.x 及更早的 Tauri WebView 版本已于 2026-09-07 移除，历史设计与验证记录见 [docs/](docs/)。
+[![Native checks](https://github.com/wushuang3625/clibo/actions/workflows/native.yml/badge.svg)](https://github.com/wushuang3625/clibo/actions/workflows/native.yml)
 
-## 快速开始
+Clibo 是一款基于 Rust + egui 构建的原生本地剪贴板管理工具，面向 Windows 提供快捷、轻量且注重隐私的剪贴板历史管理体验。
 
-```powershell
-cargo run --release --manifest-path native/Cargo.toml
-```
+当前版本：**0.4.0 原生预览版**。
 
-1. 首次打开默认暂停，点击「● 记录中」开始采集，只记录开启后新复制的内容。
-2. 在其他应用复制文字、链接或截图。
-3. 按 **Ctrl + Shift + V** 呼出面板（排列粘贴默认 Ctrl+Alt+Q），搜索并选择内容。
-4. **Enter** 尝试粘贴回原窗口；**Shift + Enter** 仅复制；**Esc** 先清空搜索，再隐藏窗口。
-5. 快捷键在偏好设置中修改：点击输入框后直接按组合键录入，自动校验修饰键与冲突。
+## 功能
 
-## 主要功能
+- 保存文字、链接以及 PNG / DIB 图片历史。
+- 中文子串搜索、类型筛选、收藏、备注和分组。
+- 队列粘贴：排序、逐条粘贴、合并粘贴和队列恢复。
+- 去空白、合并空行、大小写转换和 JSON 格式化。
+- 全局快捷键、系统托盘、固定面板、失焦隐藏和单实例。
+- 内置临时计算器：在搜索框输入 = 进入计算模式。
+- 浅色 / 深色主题和图片缩略图预览。
 
-- 文字、链接与 PNG / DIB 图片历史；中文子串搜索（正文、来源、备注、分组）、类型筛选、虚拟列表。
-- 收藏、备注、多分组归属；按住 Alt 点击加入排列队列，支持上移/下移、下一条、合并粘贴、恢复上次排列和命名队列。
-- 去空白、合并空行、大小写转换与 JSON 格式化，先预览再复制或粘贴。
-- 全局快捷键、托盘菜单、固定面板、失焦隐藏、单实例。
-- 输入 `=` 进入临时固定的计算器；实时计算、连续运算、结果复制和最近计算，Esc 返回剪贴板。
-- 浅色 / 深色「精密仪器」主题，界面状态独立持久化。
+## 下载
 
-## 数据位置与边界
+Windows x64 用户可以直接下载 [Clibo 0.4.0](https://github.com/wushuang3625/clibo/releases/tag/v0.4.0) 便携版。解压后运行 Clibo.exe，不需要 Node、WebView 或其他运行时。
 
-- Windows：`%LOCALAPPDATA%\local.clibo.native\history.db`；macOS：`~/Library/Application Support/local.clibo.native/`。可用 `CLIBO_DATA_DIR` 覆盖用于隔离测试。
-- 正文、来源、图片与设置使用 DPAPI（Windows）/ AES-256-GCM + 钥匙串（macOS）加密，绑定当前用户；加密数据库不可跨平台或跨账户直接复制。
-- 不上传剪贴板内容；写回剪贴板时带禁止云剪贴板上传标记。默认保留 2,000 条 / 30 天，收藏不按时间过期。
-- 旧 Tauri 版数据目录（`local.clibo.desktop`）不做迁移，两版数据互不影响。
+## 快速使用
 
-## 工程结构
+1. 启动后点击“记录中”开始采集。
+2. 在任意应用中复制文字、链接或图片。
+3. 按 Ctrl + Shift + V 呼出 Clibo。
+4. 搜索并选择记录，按 Enter 尝试粘贴，按 Shift + Enter 仅复制。
+5. 在偏好设置中可以修改呼出和排列粘贴快捷键。
 
-| 路径 | 用途 |
-|---|---|
-| `native/src/ui.rs` | 界面布局、主题、交互与快捷键录入 |
-| `native/src/backend.rs` | 采集、粘贴、队列与后台任务协调 |
-| `native/src/store.rs` | SQLite 存储、去重、清理和事务 |
-| `native/src/platform.rs` | Windows 剪贴板、图片格式与回粘 |
-| `native/src/model.rs` | 数据模型、设置与敏感内容规则 |
-| `native/README.md` | 构建方法与迁移说明 |
-| `docs/` | 历史设计、竞品分析与各版本验证记录 |
+## 数据与隐私
 
-## 开发
+默认数据位置：
 
-需要 Rust 1.95.0（`rust-toolchain.toml` 已固定）、Visual Studio C++ Build Tools。
+- Windows：%LOCALAPPDATA%\local.clibo.native\history.db
+- macOS：~/Library/Application Support/local.clibo.native/history.db
 
-```powershell
+界面主题状态保存在同一目录下的 ui-state.json。剪贴板正文、来源、图片和设置保存在本地加密数据库中：Windows 使用 DPAPI，macOS 使用 AES-256-GCM 和系统钥匙串。Clibo 不上传剪贴板内容。
+
+测试或演示时可以使用 CLIBO_DATA_DIR 指定独立数据目录：
+
+~~~powershell
+$env:CLIBO_DATA_DIR = "D:\CliboTestData"
+~~~
+
+## 从源码构建
+
+需要 Rust 1.95.0（仓库已通过 rust-toolchain.toml 固定），Windows 还需要 Visual Studio C++ Build Tools，macOS 需要 Xcode Command Line Tools。
+
+~~~powershell
+cargo fmt --check --manifest-path native/Cargo.toml
 cargo test --locked --manifest-path native/Cargo.toml
 cargo clippy --locked --manifest-path native/Cargo.toml -- -D warnings
 cargo build --release --locked --manifest-path native/Cargo.toml
-```
+~~~
 
-`npm run native:build` 在构建后将程序、说明与 SHA256 导出到 `output/native/`；该 Node 脚本仅用于导出，运行程序不需要 Node。
+运行开发版本：
+
+~~~powershell
+cargo run --manifest-path native/Cargo.toml
+~~~
+
+构建并导出便携版文件：
+
+~~~powershell
+npm run native:build
+~~~
+
+Windows 导出到 output/native/：
+
+~~~text
+Clibo.exe
+使用说明.md
+SHA256.txt
+~~~
+
+Node 仅用于导出文件，运行 Clibo 不需要 Node。
 
 ## 发布
 
-当前发布形态是 Windows x64 便携包，不提供安装器。发布前依次执行测试、Clippy 和构建导出：
+发布版本时需要同步更新 package.json 和 native/Cargo.toml 中的版本号，然后创建并推送版本标签：
 
-```powershell
-cargo test --locked --manifest-path native/Cargo.toml
-cargo clippy --locked --manifest-path native/Cargo.toml -- -D warnings
-npm run native:build
-Compress-Archive -Path output/native/* -DestinationPath output/Clibo-0.4.0-windows-x64.zip
-```
+~~~powershell
+git tag -a vX.Y.Z -m "Clibo X.Y.Z"
+git push origin vX.Y.Z
+~~~
 
-`output/native/` 中的 `Clibo.exe`、`使用说明.md` 和 `SHA256.txt` 是便携包内容。推送形如 `v0.4.0` 的 Git tag 后，`.github/workflows/release.yml` 会自动构建 Windows 版本并创建 GitHub Release。当前 macOS 尚未完成 `.app` 打包、签名和实机验收。
+推送 vX.Y.Z 后，GitHub Actions 会自动运行检查、构建 Windows x64 便携包、生成 SHA256 文件并创建 GitHub Release。发布工作流见 [.github/workflows/release.yml](.github/workflows/release.yml)。
+
+## 平台状态
+
+- Windows x64：提供可下载的便携版。
+- macOS：包含原生适配代码和 CI 检查，但尚未提供 .app、签名和实机验收版本。
+- 当前没有安装器、自动更新和代码签名。
+
+## 项目结构
+
+~~~text
+native/                       Rust 原生应用
+scripts/export-native.mjs     构建产物导出脚本
+.github/workflows/            CI 与 Release 工作流
+~~~
+
+## 参与贡献
+
+欢迎提交 Issue 和 Pull Request。提交前请运行格式检查、测试和 Clippy，并在描述中说明操作系统和复现步骤。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。

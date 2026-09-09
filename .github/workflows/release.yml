@@ -1,0 +1,89 @@
+name: Native release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows x64 release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - name: Validate release tag and versions
+        id: release_meta
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Release tag must use the form vX.Y.Z: $env:RELEASE_TAG"
+          }
+          $version = $Matches[0].Substring(1)
+          $cargoVersion = (Select-String -Path native/Cargo.toml -Pattern '^\s*version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($cargoVersion -ne $version) {
+            throw "native/Cargo.toml version $cargoVersion does not match tag version $version"
+          }
+          if ($packageVersion -ne $version) {
+            throw "package.json version $packageVersion does not match tag version $version"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version"
+
+      - name: Test
+        run: cargo test --locked --manifest-path native/Cargo.toml
+
+      - name: Format check
+        run: cargo fmt --check --manifest-path native/Cargo.toml
+
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path native/Cargo.toml -- -D warnings
+
+      - name: Build and export portable files
+        run: npm run native:build
+
+      - name: Package and checksum
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release_meta.outputs.version }}
+        run: |
+          $package = "output/Clibo-$env:RELEASE_VERSION-windows-x64.zip"
+          Compress-Archive -Path 'output/native/*' -DestinationPath $package -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $package).Hash.ToLowerInvariant()
+          $checksum = "$hash  $(Split-Path -Leaf $package)"
+          Set-Content -LiteralPath "$package.sha256" -Value $checksum -Encoding ascii
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_VERSION: ${{ steps.release_meta.outputs.version }}
+        run: |
+          $package = "output/Clibo-$env:RELEASE_VERSION-windows-x64.zip"
+          $checksum = "$package.sha256"
+          $notesPath = "docs/releases/v$env:RELEASE_VERSION.md"
+          if (Test-Path -LiteralPath $notesPath) {
+            $notes = Get-Content -LiteralPath $notesPath -Raw
+          } else {
+            $notes = "Clibo $env:RELEASE_VERSION — Windows x64 原生便携版。"
+          }
+          gh release create $env:RELEASE_TAG $package $checksum --verify-tag --title "Clibo $env:RELEASE_VERSION" --generate-notes --notes "$notes"

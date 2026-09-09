@@ -1,0 +1,11 @@
+{
+  "name": "clibo",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "native": "cargo run --manifest-path native/Cargo.toml",
+    "native:build": "cargo build --release --locked --manifest-path native/Cargo.toml && node scripts/export-native.mjs",
+    "native:test": "cargo test --locked --manifest-path native/Cargo.toml"
+  }
+}

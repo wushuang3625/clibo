@@ -1,0 +1,23 @@
+name: Native desktop checks
+on:
+  push:
+    paths: ['native/**', '.github/workflows/native.yml']
+  pull_request:
+    paths: ['native/**', '.github/workflows/native.yml']
+  workflow_dispatch:
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+      - run: cargo fmt --check --manifest-path native/Cargo.toml
+      - run: cargo check --locked --manifest-path native/Cargo.toml
+      - if: runner.os == 'Windows'
+        run: cargo test --locked --manifest-path native/Cargo.toml

@@ -1,0 +1,39 @@
+[package]
+name = "clibo-native"
+version = "0.4.0"
+edition = "2021"
+description = "Clibo desktop UI without a WebView"
+
+[dependencies]
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "accesskit", "x11", "wayland"] }
+global-hotkey = "0.8"
+tray-icon = "0.24"
+raw-window-handle = "0.6"
+fs2 = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
+png = "0.18"
+rust_decimal = { version = "1.43.0", default-features = false, features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_Time", "Win32_Security_Cryptography", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+arboard = "3"
+objc = "0.2"
+security-framework = "2"
+aes-gcm = "0.10"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true

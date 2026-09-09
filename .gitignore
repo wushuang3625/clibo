@@ -1,0 +1,11 @@
+node_modules/
+dist/
+native/target/
+output/native/
+output/*.zip
+output/*.sha256
+.trae/
+.cache/
+test-results/
+tmp/
+*.log

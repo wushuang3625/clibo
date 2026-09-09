@@ -1,0 +1,20 @@
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const windows = process.platform === 'win32';
+const sourceName = windows ? 'clibo-native.exe' : 'clibo-native';
+const source = resolve(root, 'native/target/release', sourceName);
+if (!existsSync(source)) throw new Error(`未找到原生 release 程序：${source}`);
+const output = resolve(root, 'output/native');
+mkdirSync(output, { recursive: true });
+const name = windows ? 'Clibo.exe' : 'clibo';
+const destination = resolve(output, name);
+copyFileSync(source, destination);
+const digest = path => createHash('sha256').update(readFileSync(path)).digest('hex');
+if (digest(source) !== digest(destination)) throw new Error('原生程序复制校验失败。');
+copyFileSync(resolve(root, 'native/README.md'), resolve(output, '使用说明.md'));
+writeFileSync(resolve(output, 'SHA256.txt'), `${digest(destination)}  ${name}\n`);
+console.log(`原生程序已导出：${destination}`);

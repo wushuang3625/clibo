@@ -23,6 +23,7 @@ pub struct Settings {
     pub excluded_apps: Vec<String>,
     pub hotkey: String,
     pub queue_hotkey: String,
+    pub find_hotkey: String,
     pub autostart: bool,
 }
 impl Default for Settings {
@@ -50,6 +51,7 @@ impl Default for Settings {
             },
             hotkey: "Ctrl+Shift+V".into(),
             queue_hotkey: "Ctrl+Alt+Q".into(),
+            find_hotkey: "Ctrl+F".into(),
             autostart: false,
         }
     }
@@ -212,6 +214,12 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{"hotkey":"Ctrl+Shift+V"}"#).unwrap();
         assert_eq!(settings.hotkey, "Ctrl+Shift+V");
         assert_eq!(settings.queue_hotkey, "Ctrl+Alt+Q");
+        assert_eq!(settings.find_hotkey, "Ctrl+F");
+        let mut custom = settings;
+        custom.find_hotkey = "Ctrl+Shift+F".into();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&custom).unwrap()).unwrap();
+        assert_eq!(restored.find_hotkey, "Ctrl+Shift+F");
     }
     #[test]
     fn legacy_saved_queues_field_is_ignored() {

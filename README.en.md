@@ -13,10 +13,22 @@ Current version: **0.4.0 native preview**.
 - Store text, links, and PNG / DIB image history.
 - Chinese substring search, type filters, favorites, notes, and groups.
 - Clipboard queues with reordering, sequential paste, merged paste, and recovery.
-- Trim whitespace, merge blank lines, change case, and format JSON.
+- Text tools for trimming whitespace, merging blank lines, and changing case.
+- A JSON workspace with validation, formatting, tree expand / collapse, nested-field search, and compact / formatted copy.
 - Global shortcuts, system tray, pinned panels, focus-loss hiding, and single-instance behavior.
 - A temporary calculator entered by typing = in the search box.
 - Light / dark themes and image thumbnail previews.
+- Manual history backup and restore, with a safety backup created before restoration.
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/images/clipboard.png" alt="Clipboard history" width="32%">
+  <img src="docs/images/calculator.png" alt="Calculator" width="32%">
+  <img src="docs/images/json-format.png" alt="JSON formatting workspace" width="32%">
+</p>
+
+Clipboard history, the temporary calculator, and the JSON workspace are native views; processing stays local.
 
 ## Download
 

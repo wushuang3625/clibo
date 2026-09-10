@@ -1,19 +1,167 @@
 use crate::{crypto, model::*};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
+
+const CURRENT_DB_VERSION: i32 = 4;
+
+#[derive(Clone, Debug)]
+pub struct RecoveryReport {
+    pub skipped_ids: Vec<String>,
+    pub backup: Option<PathBuf>,
+}
 
 pub struct Store {
     db: Connection,
+    path: PathBuf,
     pub entries: Vec<Entry>,
     pub settings: Settings,
     pub organizer: Organizer,
+    pub recovery: Option<RecoveryReport>,
 }
+
+pub struct ImageReader {
+    db: Connection,
+}
+
 fn db_err(_: rusqlite::Error) -> String {
     "本地历史读写失败，请检查磁盘空间与文件权限".into()
+}
+
+fn snapshot_db(db: &Connection, path: &Path, prefix: &str) -> Result<PathBuf, String> {
+    let backup = path.with_file_name(format!("{prefix}-{}.db", uuid::Uuid::new_v4()));
+    db.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+        .map_err(db_err)?;
+    Ok(backup)
+}
+
+fn read_organizer(db: &Connection) -> Result<Organizer, String> {
+    match db
+        .query_row("SELECT sealed FROM organizer WHERE id=1", [], |r| {
+            r.get::<_, Vec<u8>>(0)
+        })
+        .optional()
+        .map_err(db_err)?
+    {
+        Some(b) => serde_json::from_slice(&crypto::unprotect(&b)?)
+            .map_err(|_| "分组数据损坏，原始数据已保留".into()),
+        None => Ok(Organizer::default()),
+    }
+}
+
+fn read_settings(db: &Connection) -> Result<Settings, String> {
+    let sealed: Option<Vec<u8>> = db
+        .query_row("SELECT sealed FROM config WHERE id=1", [], |r| r.get(0))
+        .optional()
+        .map_err(db_err)?;
+    let mut settings = match sealed {
+        Some(b) => serde_json::from_slice(&crypto::unprotect(&b)?)
+            .map_err(|_| "设置损坏，请保留数据并检查备份".to_string())?,
+        None => Settings::default(),
+    };
+    settings.validate()?;
+    Ok(settings)
+}
+
+fn read_entries(db: &Connection) -> Result<(Vec<Entry>, Vec<String>), String> {
+    let mut entries = Vec::new();
+    let mut skipped = Vec::new();
+    let mut stmt = db
+        .prepare("SELECT id,kind,copied_at,pinned,bytes,secret FROM clips ORDER BY copied_at DESC")
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, bool>(3)?,
+                r.get::<_, usize>(4)?,
+                r.get::<_, Vec<u8>>(5)?,
+            ))
+        })
+        .map_err(db_err)?;
+    for row in rows {
+        let (id, kind, copied_at, pinned, bytes, sealed) = row.map_err(db_err)?;
+        let secret: Secret = match crypto::unprotect(&sealed).and_then(|raw| {
+            serde_json::from_slice(&raw).map_err(|_| "历史内容解析失败".to_string())
+        }) {
+            Ok(secret) => secret,
+            Err(_) => {
+                skipped.push(id);
+                continue;
+            }
+        };
+        let preview = preview(&secret, &kind);
+        entries.push(Entry {
+            search: secret.search_fields(),
+            view: ClipView {
+                id,
+                kind,
+                copied_at,
+                pinned,
+                bytes,
+                source: secret.source.clone(),
+                preview,
+                group_ids: secret.group_ids.clone(),
+                note: secret.note.clone(),
+            },
+            fingerprint: secret.fingerprint,
+        });
+    }
+    Ok((entries, skipped))
+}
+
+impl ImageReader {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let db = Connection::open(path).map_err(db_err)?;
+        db.busy_timeout(std::time::Duration::from_secs(2))
+            .map_err(db_err)?;
+        db.execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(db_err)?;
+        Ok(Self { db })
+    }
+
+    pub fn thumbnail(&self, id: &str) -> Result<Vec<u8>, String> {
+        let sealed: Option<Vec<u8>> = self
+            .db
+            .query_row("SELECT sealed FROM thumbnails WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(db_err)?;
+        if let Some(sealed) = sealed {
+            return crypto::unprotect(&sealed);
+        }
+        let sealed: Option<Vec<u8>> = self
+            .db
+            .query_row("SELECT image FROM clips WHERE id=?1", [id], |r| r.get(0))
+            .optional()
+            .map_err(db_err)?;
+        let original = crypto::unprotect(&sealed.ok_or("图片记录已不存在")?)?;
+        let thumb = crate::preview::thumbnail(&original)?;
+        let protected = crypto::protect(&thumb)?;
+        self.db
+            .execute(
+                "INSERT OR IGNORE INTO thumbnails(id,sealed) VALUES(?1,?2)",
+                params![id, protected],
+            )
+            .map_err(db_err)?;
+        self.db.execute("DELETE FROM thumbnails WHERE rowid IN (SELECT rowid FROM thumbnails ORDER BY rowid DESC LIMIT -1 OFFSET 128)", []).map_err(db_err)?;
+        Ok(thumb)
+    }
+
+    pub fn image(&self, id: &str) -> Result<Vec<u8>, String> {
+        let sealed: Option<Vec<u8>> = self
+            .db
+            .query_row("SELECT image FROM clips WHERE id=?1", [id], |r| r.get(0))
+            .optional()
+            .map_err(db_err)?;
+        crypto::unprotect(&sealed.ok_or("图片记录已不存在")?)
+    }
 }
 impl Store {
     pub fn open(path: &Path) -> Result<Self, String> {
@@ -23,14 +171,13 @@ impl Store {
         let version: i32 = db
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(db_err)?;
-        if version > 4 {
+        if version > CURRENT_DB_VERSION {
             return Err("历史由更新版本创建，请使用更新的 Clibo 打开".into());
         }
-        if (1..4).contains(&version) {
+        if (1..CURRENT_DB_VERSION).contains(&version) {
             // VACUUM INTO creates a consistent encrypted snapshot including WAL.
             // Abort the upgrade if its recovery copy cannot be created.
-            let backup = path.with_file_name(format!("history.pre-v4-{}.db", uuid::Uuid::new_v4()));
-            db.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+            snapshot_db(&db, path, "history.pre-v4")
                 .map_err(|_| "升级前备份失败，请检查磁盘空间与目录权限；历史未升级")?;
         }
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA secure_delete=ON; PRAGMA foreign_keys=ON;
@@ -39,30 +186,13 @@ impl Store {
             CREATE TABLE IF NOT EXISTS organizer(id INTEGER PRIMARY KEY CHECK(id=1),sealed BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS thumbnails(id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,sealed BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS image_metadata(id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,width INTEGER NOT NULL,height INTEGER NOT NULL);").map_err(db_err)?;
-        let organizer = match db
-            .query_row("SELECT sealed FROM organizer WHERE id=1", [], |r| {
-                r.get::<_, Vec<u8>>(0)
-            })
-            .optional()
-            .map_err(db_err)?
+        let organizer = read_organizer(&db)?;
+        let mut settings = read_settings(&db)?;
+        // v1-v3 使用 Ctrl+Alt+V 作为默认呼出键。仅在旧库升级到 v4 时迁移一次；
+        // v4 之后用户主动改回 Ctrl+Alt+V 必须保持不变。
+        if (1..CURRENT_DB_VERSION).contains(&version)
+            && settings.hotkey.eq_ignore_ascii_case("Ctrl+Alt+V")
         {
-            Some(b) => serde_json::from_slice(&crypto::unprotect(&b)?)
-                .map_err(|_| "分组数据损坏，原始数据已保留")?,
-            None => Organizer::default(),
-        };
-        let sealed: Option<Vec<u8>> = db
-            .query_row("SELECT sealed FROM config WHERE id=1", [], |r| r.get(0))
-            .optional()
-            .map_err(db_err)?;
-        let mut settings: Settings = match sealed {
-            Some(b) => serde_json::from_slice(&crypto::unprotect(&b)?)
-                .map_err(|_| "设置损坏，请保留数据并检查备份".to_string())?,
-            None => Settings::default(),
-        };
-        settings.validate()?;
-        // 默认呼出键由 Ctrl+Alt+V 迁移到 Ctrl+Shift+V：仅当保存的仍是旧默认值时
-        // 一次性改写并立即落盘，用户自定义键位不受影响。
-        if settings.hotkey.eq_ignore_ascii_case("Ctrl+Alt+V") {
             settings.hotkey = "Ctrl+Shift+V".into();
             let bytes = serde_json::to_vec(&settings).map_err(|_| "设置序列化失败".to_string())?;
             let sealed = crypto::protect(&bytes)?;
@@ -72,55 +202,29 @@ impl Store {
             )
             .map_err(db_err)?;
         }
-        let mut entries = Vec::new();
-        {
-            let mut stmt=db.prepare("SELECT id,kind,copied_at,pinned,bytes,secret FROM clips ORDER BY copied_at DESC").map_err(db_err)?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, bool>(3)?,
-                        r.get::<_, usize>(4)?,
-                        r.get::<_, Vec<u8>>(5)?,
-                    ))
-                })
-                .map_err(db_err)?;
-            for row in rows {
-                let (id, kind, copied_at, pinned, bytes, sealed) = row.map_err(db_err)?;
-                let secret: Secret = serde_json::from_slice(&crypto::unprotect(&sealed)?)
-                    .map_err(|_| "历史内容损坏；原始数据已保留".to_string())?;
-                let preview = preview(&secret, &kind);
-                // Only the view, search copy, and fingerprint stay resident;
-                // the secret itself is dropped and re-read from SQLite on demand.
-                entries.push(Entry {
-                    search: secret.search_fields(),
-                    view: ClipView {
-                        id,
-                        kind,
-                        copied_at,
-                        pinned,
-                        bytes,
-                        source: secret.source.clone(),
-                        preview,
-                        group_ids: secret.group_ids.clone(),
-                        note: secret.note.clone(),
-                    },
-                    fingerprint: secret.fingerprint,
-                });
-            }
-        }
+        let (entries, skipped_ids) = read_entries(&db)?;
+        // A bad record must not make every readable record unavailable. Keep the
+        // original row untouched and create a consistent snapshot for recovery.
+        let recovery = if skipped_ids.is_empty() {
+            None
+        } else {
+            Some(RecoveryReport {
+                backup: snapshot_db(&db, path, "history.recovery").ok(),
+                skipped_ids,
+            })
+        };
         let mut store = Self {
             db,
+            path: path.to_path_buf(),
             entries,
             settings,
             organizer,
+            recovery,
         };
         store.cleanup()?;
         store
             .db
-            .execute_batch("PRAGMA user_version=4;")
+            .execute_batch(&format!("PRAGMA user_version={CURRENT_DB_VERSION};"))
             .map_err(db_err)?;
         Ok(store)
     }
@@ -196,19 +300,22 @@ impl Store {
             .iter()
             .position(|e| e.fingerprint == fingerprint && e.view.kind == kind)
         {
-            // Re-copied content: the bytes are identical, so the sealed secret,
-            // image, and pinned flag stay untouched. Only the timestamp moves,
-            // and the source keeps the original capture's provenance.
-            let mut entry = self.entries.remove(position);
-            let original = position;
+            // Re-copied content: plan against a clone and leave the resident index
+            // untouched until SQLite commits. A failed write must not lose history
+            // from memory for the remainder of the process lifetime.
+            let mut entry = self.entries[position].clone();
             entry.view.copied_at = now();
             let removed = evictions(
-                std::iter::once(&entry).chain(self.entries.iter()),
+                std::iter::once(&entry).chain(
+                    self.entries
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, current)| (index != position).then_some(current)),
+                ),
                 &self.settings,
                 &self.organizer.protected_ids(),
             );
             if removed.contains(&entry.view.id) {
-                self.entries.insert(original, entry);
                 return Err(
                     "已保存、排列队列或撤销保护内容已占满容量，请先整理或等待撤销保护到期".into(),
                 );
@@ -224,7 +331,8 @@ impl Store {
                     .map_err(db_err)?;
             }
             tx.commit().map_err(db_err)?;
-            self.entries.retain(|e| !removed.contains(&e.view.id));
+            self.entries
+                .retain(|e| e.view.id != entry.view.id && !removed.contains(&e.view.id));
             self.entries.insert(0, entry);
             return Ok(true);
         }
@@ -280,6 +388,117 @@ impl Store {
         self.entries.insert(0, entry);
         Ok(true)
     }
+    pub fn backup_history(&self) -> Result<PathBuf, String> {
+        snapshot_db(&self.db, &self.path, "history.manual")
+            .map_err(|_| "历史备份失败，请检查磁盘空间与目录权限".into())
+    }
+
+    pub fn restore_latest_history_backup(&mut self) -> Result<PathBuf, String> {
+        let dir = self.path.parent().ok_or("无法确定历史数据目录")?;
+        let backup = std::fs::read_dir(dir)
+            .map_err(|_| "无法读取历史数据目录")?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with("history.manual-") && name.ends_with(".db")
+                })
+            })
+            .max_by_key(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok())
+            .ok_or("还没有手动历史备份")?;
+        let source = Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(db_err)?;
+        let integrity: String = source
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .map_err(db_err)?;
+        if integrity != "ok" {
+            return Err("备份数据库完整性校验失败，未执行恢复".into());
+        }
+        for table in ["clips", "organizer", "thumbnails", "image_metadata"] {
+            let exists: i64 = source
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            if exists != 1 {
+                return Err("备份格式不完整，未执行恢复".into());
+            }
+        }
+        drop(source);
+        // Never overwrite the current history without first creating a rollback copy.
+        snapshot_db(&self.db, &self.path, "history.pre-restore")
+            .map_err(|_| "恢复前安全备份失败，已取消恢复".to_string())?;
+        self.db
+            .execute(
+                "ATTACH DATABASE ?1 AS restore_src",
+                [backup.to_string_lossy().as_ref()],
+            )
+            .map_err(db_err)?;
+        let restore = (|| -> Result<(), String> {
+            let tx = self.db.transaction().map_err(db_err)?;
+            tx.execute("DELETE FROM thumbnails", []).map_err(db_err)?;
+            tx.execute("DELETE FROM image_metadata", [])
+                .map_err(db_err)?;
+            tx.execute("DELETE FROM clips", []).map_err(db_err)?;
+            tx.execute("DELETE FROM organizer", []).map_err(db_err)?;
+            tx.execute("INSERT INTO clips(id,kind,copied_at,pinned,bytes,secret,image) SELECT id,kind,copied_at,pinned,bytes,secret,image FROM restore_src.clips", []).map_err(db_err)?;
+            tx.execute(
+                "INSERT INTO organizer(id,sealed) SELECT id,sealed FROM restore_src.organizer",
+                [],
+            )
+            .map_err(db_err)?;
+            tx.execute(
+                "INSERT INTO thumbnails(id,sealed) SELECT id,sealed FROM restore_src.thumbnails",
+                [],
+            )
+            .map_err(db_err)?;
+            tx.execute("INSERT INTO image_metadata(id,width,height) SELECT id,width,height FROM restore_src.image_metadata", []).map_err(db_err)?;
+            tx.commit().map_err(db_err)?;
+            Ok(())
+        })();
+        let detached = self
+            .db
+            .execute_batch("DETACH DATABASE restore_src")
+            .map_err(db_err);
+        if let Err(error) = restore {
+            let _ = detached;
+            return Err(error);
+        }
+        detached?;
+        let organizer = read_organizer(&self.db)?;
+        let (entries, skipped_ids) = read_entries(&self.db)?;
+        self.organizer = organizer;
+        self.entries = entries;
+        self.recovery = if skipped_ids.is_empty() {
+            None
+        } else {
+            Some(RecoveryReport {
+                skipped_ids,
+                backup: Some(backup.clone()),
+            })
+        };
+        self.cleanup()?;
+        Ok(backup)
+    }
+
+    pub fn recovery_status(&self) -> Option<String> {
+        self.recovery.as_ref().map(|report| {
+            let backup = if report.backup.is_some() {
+                "，已保留恢复快照"
+            } else {
+                ""
+            };
+            format!(
+                "已加载可读历史，隔离 {} 条损坏记录{}",
+                report.skipped_ids.len(),
+                backup
+            )
+        })
+    }
+
     pub fn cleanup(&mut self) -> Result<(), String> {
         let removed = evictions(
             self.entries.iter(),
@@ -478,7 +697,8 @@ impl Store {
         }
         self.queue(previous)
     }
-    /// Binary preview transport for native clients; avoid Base64/JSON copies.
+    /// Test-only compatibility helpers for verifying encrypted thumbnail storage.
+    #[cfg(test)]
     pub fn thumbnail_png(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
         let sealed: Option<Vec<u8>> = self
             .db
@@ -489,6 +709,7 @@ impl Store {
             .map_err(db_err)?;
         sealed.map(|b| crypto::unprotect(&b)).transpose()
     }
+    #[cfg(test)]
     pub fn cache_thumbnail(&self, id: &str, png: &[u8]) -> Result<(), String> {
         // A record can be deleted while the worker is resizing its image.
         if self.entries.iter().any(|e| e.view.id == id) {
@@ -745,6 +966,43 @@ mod tests {
         assert_eq!(s.secret(&id).unwrap().source, "First.exe");
         assert_eq!(s.entries[0].view.source, "First.exe");
     }
+    #[test]
+    fn failed_recopy_keeps_resident_history_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(&dir.path().join("dedup-failure.db")).unwrap();
+        s.insert(clip("first")).unwrap();
+        let first = s.entries[0].view.id.clone();
+        s.insert(clip("second")).unwrap();
+        let before: Vec<_> = s
+            .entries
+            .iter()
+            .map(|entry| (entry.view.id.clone(), entry.view.copied_at))
+            .collect();
+        let disk_before: i64 =
+            s.db.query_row("SELECT copied_at FROM clips WHERE id=?1", [&first], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        s.db.execute_batch(
+            "CREATE TRIGGER refuse_recopy BEFORE UPDATE OF copied_at ON clips \
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+        assert!(s.insert(clip("first")).is_err());
+        let after: Vec<_> = s
+            .entries
+            .iter()
+            .map(|entry| (entry.view.id.clone(), entry.view.copied_at))
+            .collect();
+        assert_eq!(after, before);
+        assert_eq!(
+            s.db.query_row("SELECT copied_at FROM clips WHERE id=?1", [&first], |row| {
+                row.get::<_, i64>(0)
+            },)
+                .unwrap(),
+            disk_before
+        );
+    }
     fn clip(s: &str) -> Captured {
         Captured {
             text: Some(s.into()),
@@ -938,16 +1196,35 @@ mod tests {
         assert!(s.organizer.groups.is_empty());
     }
     #[test]
-    fn old_default_hotkey_migrates_to_ctrl_shift_v() {
+    fn old_default_hotkey_migrates_to_ctrl_shift_v_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hotkey.db");
         let mut s = Store::open(&path).unwrap();
         let mut settings = s.settings.clone();
         settings.hotkey = "Ctrl+Alt+V".into();
         s.save_settings(settings).unwrap();
+        s.db.execute_batch("PRAGMA user_version=3;").unwrap();
+        drop(s);
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(s.settings.hotkey, "Ctrl+Shift+V");
+        let mut user_choice = s.settings.clone();
+        user_choice.hotkey = "Ctrl+Alt+V".into();
+        s.save_settings(user_choice).unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.settings.hotkey, "Ctrl+Shift+V");
+        assert_eq!(s.settings.hotkey, "Ctrl+Alt+V");
+    }
+    #[test]
+    fn current_database_preserves_user_selected_legacy_hotkey() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current-hotkey.db");
+        let mut s = Store::open(&path).unwrap();
+        let mut settings = s.settings.clone();
+        settings.hotkey = "Ctrl+Alt+V".into();
+        s.save_settings(settings).unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.settings.hotkey, "Ctrl+Alt+V");
     }
     #[test]
     fn custom_hotkey_survives_default_migration() {
@@ -1009,6 +1286,99 @@ mod tests {
             .copied_at = 0;
         s.cleanup().unwrap();
         assert_eq!(s.entries.len(), 1);
+    }
+    #[test]
+    fn corrupt_history_row_is_isolated_and_original_is_snapshotted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery.db");
+        let mut s = Store::open(&path).unwrap();
+        s.insert(clip("readable")).unwrap();
+        let readable = s.entries[0].view.id.clone();
+        s.insert(clip("will-corrupt")).unwrap();
+        let corrupt = s.entries[0].view.id.clone();
+        s.db.execute(
+            "UPDATE clips SET secret=?1 WHERE id=?2",
+            params![vec![1_u8, 2, 3, 4], corrupt],
+        )
+        .unwrap();
+        drop(s);
+
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.entries.len(), 1);
+        assert_eq!(s.entries[0].view.id, readable);
+        let recovery = s.recovery.as_ref().expect("损坏记录应触发恢复报告");
+        assert_eq!(recovery.skipped_ids, vec![corrupt.clone()]);
+        let backup = recovery.backup.as_ref().expect("应尽力创建恢复快照");
+        assert!(backup.exists());
+        let backup_db = Connection::open(backup).unwrap();
+        assert_eq!(
+            backup_db
+                .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            s.db.query_row("SELECT COUNT(*) FROM clips", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+    #[test]
+    fn manual_backup_restore_keeps_current_settings_and_creates_safety_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manual-restore.db");
+        let mut s = Store::open(&path).unwrap();
+        s.insert(clip("before-backup")).unwrap();
+        let backup = s.backup_history().unwrap();
+        assert!(backup.exists());
+        s.insert(clip("after-backup")).unwrap();
+        let mut settings = s.settings.clone();
+        settings.hotkey = "Ctrl+Alt+K".into();
+        s.save_settings(settings).unwrap();
+        let restored = s.restore_latest_history_backup().unwrap();
+        assert_eq!(restored, backup);
+        assert_eq!(s.entries.len(), 1);
+        assert_eq!(
+            s.secret(&s.entries[0].view.id).unwrap().text.as_deref(),
+            Some("before-backup")
+        );
+        assert_eq!(s.settings.hotkey, "Ctrl+Alt+K");
+        assert!(std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("history.pre-restore-")
+        }));
+    }
+    #[test]
+    fn independent_image_reader_generates_and_caches_thumbnail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker-image.db");
+        let image = image::RgbaImage::from_pixel(1200, 800, image::Rgba([20, 40, 60, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let original = png.into_inner();
+        let mut s = Store::open(&path).unwrap();
+        s.insert(Captured {
+            text: None,
+            png: Some(original.clone()),
+            source: "test.exe".into(),
+        })
+        .unwrap();
+        let id = s.entries[0].view.id.clone();
+        assert!(s.thumbnail_png(&id).unwrap().is_none());
+        drop(s);
+
+        let reader = ImageReader::open(&path).unwrap();
+        let thumbnail = reader.thumbnail(&id).unwrap();
+        let decoded = image::load_from_memory(&thumbnail).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (320, 213));
+        assert_eq!(reader.image(&id).unwrap(), original);
+        drop(reader);
+
+        let s = Store::open(&path).unwrap();
+        assert!(s.thumbnail_png(&id).unwrap().is_some());
     }
     #[test]
     fn failed_settings_cleanup_rolls_back_config_and_history() {

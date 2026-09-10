@@ -2,7 +2,7 @@ use crate::{
     backend::{self, Backend},
     model::*,
     platform,
-    store::Store,
+    store::{ImageReader, Store},
 };
 use eframe::egui::{self, Color32, CornerRadius, RichText, Vec2};
 use global_hotkey::{
@@ -11,8 +11,8 @@ use global_hotkey::{
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
-    collections::{HashMap, VecDeque},
-    path::Path,
+    collections::{HashMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{atomic::Ordering, mpsc, Arc},
 };
@@ -32,17 +32,92 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 
 mod calculator_ui;
+mod json_parser;
+mod json_ui;
+mod json_view;
 
 const ROW_HEIGHT: f32 = 64.;
 const ROW_STEP: f32 = ROW_HEIGHT + 8.;
 /// Bounded row-thumbnail texture cache (24 × ~320×240 ≈ 7 MB of GPU memory).
 const THUMB_CACHE: usize = 24;
-/// Maximum row thumbnails decoded per frame; the rest wait for repaints.
+/// Maximum row thumbnail jobs queued per frame; decoding happens off the UI thread.
 const THUMB_BUDGET: u8 = 4;
 
 enum Event {
     Open(bool, usize),
     Quit,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum ImageKind {
+    Thumbnail,
+    Full(u32),
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ImageJob {
+    id: String,
+    kind: ImageKind,
+    epoch: u64,
+}
+
+struct DecodedImage {
+    size: [usize; 2],
+    rgba: Vec<u8>,
+}
+
+struct ImageDone {
+    job: ImageJob,
+    result: Result<DecodedImage, String>,
+}
+
+fn decode_image(png: &[u8], max_side: Option<u32>) -> Result<DecodedImage, String> {
+    let mut image = image::load_from_memory(png).map_err(|e| e.to_string())?;
+    if let Some(side) = max_side {
+        if image.width() == 0
+            || image.height() == 0
+            || u64::from(image.width()) * u64::from(image.height()) > 25_000_000
+        {
+            return Err("图片超过预览大小限制".into());
+        }
+        if image.width() > side || image.height() > side {
+            image = image.thumbnail(side, side);
+        }
+    }
+    let rgba = image.into_rgba8();
+    Ok(DecodedImage {
+        size: [rgba.width() as usize, rgba.height() as usize],
+        rgba: rgba.into_raw(),
+    })
+}
+
+fn spawn_image_worker(
+    path: PathBuf,
+    ctx: egui::Context,
+) -> (mpsc::SyncSender<ImageJob>, mpsc::Receiver<ImageDone>) {
+    let (job_tx, job_rx) = mpsc::sync_channel::<ImageJob>(32);
+    let (done_tx, done_rx) = mpsc::channel::<ImageDone>();
+    std::thread::spawn(move || {
+        let reader = ImageReader::open(&path);
+        while let Ok(job) = job_rx.recv() {
+            let result = match &reader {
+                Ok(reader) => match &job.kind {
+                    ImageKind::Thumbnail => reader
+                        .thumbnail(&job.id)
+                        .and_then(|png| decode_image(&png, None)),
+                    ImageKind::Full(side) => reader
+                        .image(&job.id)
+                        .and_then(|png| decode_image(&png, Some(*side))),
+                },
+                Err(error) => Err(error.clone()),
+            };
+            if done_tx.send(ImageDone { job, result }).is_err() {
+                break;
+            }
+            ctx.request_repaint();
+        }
+    });
+    (job_tx, done_rx)
 }
 fn dispatch(tx: &mpsc::Sender<Event>, event: Event, backend: &Backend, ctx: &egui::Context) {
     if tx.send(event).is_ok() {
@@ -57,6 +132,7 @@ fn dispatch(tx: &mpsc::Sender<Event>, event: Event, backend: &Backend, ctx: &egu
 enum HotkeySlot {
     Show,
     Queue,
+    Find,
 }
 pub struct App {
     backend: Arc<Backend>,
@@ -70,6 +146,8 @@ pub struct App {
     events: mpsc::Receiver<Event>,
     query: String,
     calculator: crate::calculator::Calculator,
+    json: json_ui::JsonPage,
+    json_window: json_ui::WindowTransition,
     filter: String,
     group: String,
     items: Vec<ClipView>,
@@ -78,6 +156,9 @@ pub struct App {
     dirty: bool,
     focus_search: bool,
     scroll_selected: bool,
+    history_offset: f32,
+    history_up_distance: f32,
+    history_top: bool,
     target: usize,
     owner: usize,
     pinned: bool,
@@ -103,6 +184,12 @@ pub struct App {
     thumbs: HashMap<String, egui::TextureHandle>,
     thumb_order: VecDeque<String>,
     thumb_budget: u8,
+    preview_is_image: bool,
+    image_tx: mpsc::SyncSender<ImageJob>,
+    image_rx: mpsc::Receiver<ImageDone>,
+    image_pending: HashSet<ImageJob>,
+    image_failed: HashSet<ImageJob>,
+    image_epoch: u64,
 }
 
 fn register(manager: &GlobalHotKeyManager, settings: &Settings) -> Result<Vec<HotKey>, String> {
@@ -130,7 +217,8 @@ pub fn run() -> Result<(), String> {
     let Some(instance) = crate::instance::Instance::acquire(&path)? else {
         return Ok(());
     };
-    let mut store = Store::open(&path.join("history.db"))?;
+    let history_path = path.join("history.db");
+    let mut store = Store::open(&history_path)?;
     if std::env::args().any(|a| a == "--demo") {
         if std::env::var_os("CLIBO_DATA_DIR").is_none() || !store.entries.is_empty() {
             return Err("演示模式要求 CLIBO_DATA_DIR 指向空的独立测试目录".into());
@@ -179,6 +267,8 @@ pub fn run() -> Result<(), String> {
             install_fonts(&cc.egui_ctx);
             apply_theme(&cc.egui_ctx, ui_state.dark);
             let backend = Backend::new(store, cc.egui_ctx.clone());
+            let (image_tx, image_rx) =
+                spawn_image_worker(history_path.clone(), cc.egui_ctx.clone());
             let settings = backend.store.lock().unwrap().settings.clone();
             let hotkeys = GlobalHotKeyManager::new()?;
             let (registered, hotkey_error) = match register(&hotkeys, &settings) {
@@ -279,6 +369,8 @@ pub fn run() -> Result<(), String> {
                 excluded: settings.excluded_apps.join("\n"),
                 settings,
                 query: String::new(),
+                json: json_ui::JsonPage::initial(),
+                json_window: json_ui::WindowTransition::default(),
                 calculator: {
                     let mut calc = crate::calculator::Calculator::default();
                     if std::env::var_os("CLIBO_DATA_DIR").is_some()
@@ -304,6 +396,9 @@ pub fn run() -> Result<(), String> {
                 dirty: true,
                 focus_search: true,
                 scroll_selected: false,
+                history_offset: 0.,
+                history_up_distance: 0.,
+                history_top: false,
                 target,
                 owner: 0,
                 pinned: std::env::args().any(|a| a == "--pinned" || a == "--smoke"),
@@ -330,6 +425,12 @@ pub fn run() -> Result<(), String> {
                 thumbs: HashMap::new(),
                 thumb_order: VecDeque::new(),
                 thumb_budget: THUMB_BUDGET,
+                preview_is_image: false,
+                image_tx,
+                image_rx,
+                image_pending: HashSet::new(),
+                image_failed: HashSet::new(),
+                image_epoch: 0,
             }))
         }),
     )
@@ -853,6 +954,51 @@ fn hotkey_modifiers(m: egui::Modifiers) -> HotkeyMods {
     }
     out
 }
+
+fn consume_local_shortcut(ctx: &egui::Context, raw: &str) -> bool {
+    let Ok(shortcut) = HotKey::from_str(raw) else {
+        return false;
+    };
+    ctx.input_mut(|input| {
+        let mut matched = false;
+        let current_mods = hotkey_modifiers(input.modifiers);
+        input.events.retain(|event| {
+            let pressed = match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => key_code(*key).map(|code| (code, hotkey_modifiers(*modifiers))),
+                egui::Event::Copy => Some((Code::KeyC, current_mods)),
+                egui::Event::Cut => Some((Code::KeyX, current_mods)),
+                egui::Event::Paste(_) => Some((Code::KeyV, current_mods)),
+                _ => None,
+            };
+            let hit = pressed.is_some_and(|(code, mods)| HotKey::new(Some(mods), code) == shortcut);
+            matched |= hit;
+            !hit
+        });
+        matched
+    })
+}
+
+impl App {
+    fn consume_find_shortcut(&self, ctx: &egui::Context) -> bool {
+        if self.hotkey_capture.is_some() || self.ime_composing {
+            return false;
+        }
+        let shortcut = self
+            .backend
+            .store
+            .lock()
+            .unwrap()
+            .settings
+            .find_hotkey
+            .clone();
+        consume_local_shortcut(ctx, &shortcut)
+    }
+}
 /// Windows VK → 可注册按键；字母/数字用字面 VK（0x41-0x5A / 0x30-0x39）。
 #[cfg(windows)]
 const HOTKEY_VKS: &[(u16, Code)] = &[
@@ -1172,6 +1318,7 @@ impl App {
         self.backend.visible.store(false, Ordering::Relaxed);
         self.enlarged_image = None;
         self.texture = None;
+        self.preview_is_image = false;
         self.preview_id.clear();
         self.preview_text = String::new();
         self.items = Vec::new();
@@ -1232,6 +1379,125 @@ impl App {
             self.target,
         );
     }
+    fn queue_image(&mut self, job: ImageJob, ctx: &egui::Context) {
+        if job.epoch != self.image_epoch
+            || self.image_pending.contains(&job)
+            || self.image_failed.contains(&job)
+        {
+            return;
+        }
+        match self.image_tx.try_send(job.clone()) {
+            Ok(()) => {
+                self.image_pending.insert(job);
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.image_failed.insert(job);
+                self.backend
+                    .report(Err("图片后台处理已停止，请重启 Clibo".into()));
+            }
+        }
+    }
+    fn drain_images(&mut self, ctx: &egui::Context) {
+        while let Ok(ImageDone { job, result }) = self.image_rx.try_recv() {
+            self.image_pending.remove(&job);
+            if job.epoch != self.image_epoch {
+                continue;
+            }
+            match result {
+                Ok(decoded) => {
+                    self.image_failed.remove(&job);
+                    let image =
+                        egui::ColorImage::from_rgba_unmultiplied(decoded.size, &decoded.rgba);
+                    match job.kind {
+                        ImageKind::Thumbnail => {
+                            let id = job.id;
+                            let texture =
+                                ctx.load_texture(format!("thumb-{id}"), image, Default::default());
+                            self.thumbs.insert(id.clone(), texture.clone());
+                            if let Some(pos) = self.thumb_order.iter().position(|old| old == &id) {
+                                self.thumb_order.remove(pos);
+                            }
+                            self.thumb_order.push_back(id.clone());
+                            while self.thumbs.len() > THUMB_CACHE {
+                                if let Some(old) = self.thumb_order.pop_front() {
+                                    self.thumbs.remove(&old);
+                                } else {
+                                    break;
+                                }
+                            }
+                            if self.preview_is_image && self.preview_id == id {
+                                self.texture = Some(texture);
+                            }
+                        }
+                        ImageKind::Full(_) => {
+                            if self.preview_is_image && self.preview_id == job.id {
+                                self.enlarged_image = Some(ctx.load_texture(
+                                    "enlarged-image",
+                                    image,
+                                    Default::default(),
+                                ));
+                                self.image_actual_size = false;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.image_failed.insert(job);
+                    self.backend.report(Err(error));
+                }
+            }
+        }
+    }
+    fn reset_image_jobs(&mut self) {
+        self.image_epoch = self.image_epoch.wrapping_add(1);
+        self.image_pending.clear();
+        self.image_failed.clear();
+        self.thumbs.clear();
+        self.thumb_order.clear();
+        self.texture = None;
+        self.enlarged_image = None;
+        self.preview_is_image = false;
+        self.preview_id.clear();
+    }
+    fn backup_history(&mut self) {
+        let result = self.backend.store.lock().unwrap().backup_history();
+        match result {
+            Ok(path) => {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "history.manual.db".into());
+                *self.backend.status.lock().unwrap() = format!("历史备份完成：{name}");
+                self.backend.changed();
+            }
+            Err(error) => self.backend.report(Err(error)),
+        }
+    }
+    fn restore_history(&mut self) {
+        let result = self
+            .backend
+            .store
+            .lock()
+            .unwrap()
+            .restore_latest_history_backup();
+        match result {
+            Ok(path) => {
+                self.reset_image_jobs();
+                self.selected.clear();
+                self.dirty = true;
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "history.manual.db".into());
+                *self.backend.status.lock().unwrap() = format!("已从备份恢复历史：{name}");
+                self.backend.changed();
+            }
+            Err(error) => self.backend.report(Err(error)),
+        }
+    }
     fn preview(&mut self, ctx: &egui::Context) {
         if self.preview_id == self.selected {
             return;
@@ -1239,111 +1505,79 @@ impl App {
         self.texture = None;
         self.enlarged_image = None;
         self.preview_text.clear();
+        self.preview_is_image = false;
         self.transform = "original".into();
         self.preview_id = self.selected.clone();
-        // Hold the store lock only to fetch metadata and raw bytes; PNG decoding
-        // and texture upload run afterwards so capture never waits on decode.
-        enum Loaded {
-            Text,
-            Thumb(Vec<u8>),
-            Original(Vec<u8>),
-        }
-        let loaded: Result<Loaded, String> = {
+        let selected = self.selected.clone();
+        let loaded: Result<(String, Vec<String>, bool, Option<String>), String> = {
             let store = self.backend.store.lock().unwrap();
-            let Some(entry) = store.entries.iter().find(|e| e.view.id == self.selected) else {
+            let Some(entry) = store.entries.iter().find(|e| e.view.id == selected) else {
                 return;
             };
-            self.note = entry.view.note.clone();
-            self.memberships = entry.view.group_ids.clone();
             if entry.view.kind == "image" {
-                match store.thumbnail_png(&self.selected) {
-                    Ok(Some(thumb)) => Ok(Loaded::Thumb(thumb)),
-                    Ok(None) => store.image(&self.selected).map(Loaded::Original),
-                    Err(e) => Err(e),
-                }
+                Ok((
+                    entry.view.note.clone(),
+                    entry.view.group_ids.clone(),
+                    true,
+                    None,
+                ))
             } else {
-                match store.secret(&self.selected) {
-                    Ok(secret) => {
-                        if let Some(text) = secret.text {
-                            self.preview_text = text.chars().take(32_000).collect();
-                            if text.chars().count() > 32_000 {
-                                self.preview_text
-                                    .push_str("\n\n[预览已截断；复制与粘贴使用完整原文]");
-                            }
-                        }
-                        Ok(Loaded::Text)
-                    }
-                    Err(e) => Err(e),
-                }
+                store.secret(&selected).map(|secret| {
+                    (
+                        entry.view.note.clone(),
+                        entry.view.group_ids.clone(),
+                        false,
+                        secret.text,
+                    )
+                })
             }
         };
-        let png = match loaded {
-            Ok(Loaded::Text) => return,
-            Ok(Loaded::Thumb(png)) => png,
-            Ok(Loaded::Original(png)) => {
-                let thumbnail = crate::preview::thumbnail(&png).and_then(|t| {
-                    self.backend
-                        .store
-                        .lock()
-                        .unwrap()
-                        .cache_thumbnail(&self.selected, &t)
-                        .map(|_| t)
-                });
-                match thumbnail {
-                    Ok(t) => t,
-                    Err(e) => {
-                        self.backend.report(Err(e));
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                self.backend.report(Err(e));
+        let (note, memberships, is_image, text) = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.backend.report(Err(error));
                 return;
             }
         };
-        match image::load_from_memory(&png) {
-            Ok(img) => {
-                let rgba = img.into_rgba8();
-                let size = [rgba.width() as usize, rgba.height() as usize];
-                self.texture = Some(ctx.load_texture(
-                    "preview",
-                    egui::ColorImage::from_rgba_unmultiplied(size, &rgba),
-                    Default::default(),
-                ));
+        self.note = note;
+        self.memberships = memberships;
+        self.preview_is_image = is_image;
+        if is_image {
+            if let Some(texture) = self.thumbs.get(&selected).cloned() {
+                self.texture = Some(texture);
+            } else {
+                self.queue_image(
+                    ImageJob {
+                        id: selected,
+                        kind: ImageKind::Thumbnail,
+                        epoch: self.image_epoch,
+                    },
+                    ctx,
+                );
             }
-            Err(e) => self.backend.report(Err(e.to_string())),
+            return;
+        }
+        if let Some(text) = text {
+            self.preview_text = text.chars().take(32_000).collect();
+            if text.chars().count() > 32_000 {
+                self.preview_text
+                    .push_str("\n\n[预览已截断；复制与粘贴使用完整原文]");
+            }
         }
     }
     fn enlarge_image(&mut self, ctx: &egui::Context) {
-        let png = self.backend.store.lock().unwrap().image(&self.selected);
-        let result = png.and_then(|png| {
-            let reader = image::ImageReader::new(std::io::Cursor::new(&png))
-                .with_guessed_format()
-                .map_err(|e| e.to_string())?;
-            let (w, h) = reader.into_dimensions().map_err(|e| e.to_string())?;
-            if w == 0 || h == 0 || u64::from(w) * u64::from(h) > 25_000_000 {
-                return Err("图片超过预览大小限制".into());
-            }
-            let mut img = image::load_from_memory(&png).map_err(|e| e.to_string())?;
-            let side = ctx.input(|i| i.max_texture_side) as u32;
-            if w > side || h > side {
-                img = img.thumbnail(side, side);
-            }
-            let rgba = img.into_rgba8();
-            Ok(egui::ColorImage::from_rgba_unmultiplied(
-                [rgba.width() as usize, rgba.height() as usize],
-                &rgba,
-            ))
-        });
-        match result {
-            Ok(image) => {
-                self.enlarged_image =
-                    Some(ctx.load_texture("enlarged-image", image, Default::default()));
-                self.image_actual_size = false;
-            }
-            Err(e) => self.backend.report(Err(e)),
+        if !self.preview_is_image || self.selected.is_empty() {
+            return;
         }
+        let side = ctx.input(|i| i.max_texture_side) as u32;
+        self.queue_image(
+            ImageJob {
+                id: self.selected.clone(),
+                kind: ImageKind::Full(side),
+                epoch: self.image_epoch,
+            },
+            ctx,
+        );
     }
     fn save_settings(&mut self) {
         let mut next = self.settings.clone();
@@ -1455,23 +1689,30 @@ impl App {
             return;
         }
         let hotkey = HotKey::new(Some(mods), code);
-        let other = match slot {
-            HotkeySlot::Show => self.settings.queue_hotkey.clone(),
-            HotkeySlot::Queue => self.settings.hotkey.clone(),
-        };
-        if HotKey::from_str(&other).is_ok_and(|h| h == hotkey) {
+        let conflict = [
+            (HotkeySlot::Show, &self.settings.hotkey),
+            (HotkeySlot::Queue, &self.settings.queue_hotkey),
+            (HotkeySlot::Find, &self.settings.find_hotkey),
+        ]
+        .iter()
+        .any(|(other_slot, other)| {
+            *other_slot != slot && HotKey::from_str(other).is_ok_and(|h| h == hotkey)
+        });
+        if conflict {
             self.capture_error = "与另一个快捷键相同".into();
             return;
         }
         match slot {
             HotkeySlot::Show => self.settings.hotkey = hotkey.to_string(),
             HotkeySlot::Queue => self.settings.queue_hotkey = hotkey.to_string(),
+            HotkeySlot::Find => self.settings.find_hotkey = hotkey.to_string(),
         }
         self.hotkey_capture = None;
         self.capture_error.clear();
     }
-    /// 48×36 row thumbnail. Cached textures are bounded by an LRU so a long
-    /// scroll cannot accumulate GPU memory; decoding is amortized per frame.
+    /// 48×36 row thumbnail. The UI only queues bounded work and paints a
+    /// placeholder; SQLite reads, decryption, resizing and pixel decoding all run
+    /// on the image worker.
     fn row_thumbnail(&mut self, ui: &mut egui::Ui, item: &ClipView) {
         let p = palette(self.dark);
         let cached = self.thumbs.get(&item.id).cloned();
@@ -1488,74 +1729,21 @@ impl App {
             );
             return;
         }
-        if self.thumb_budget == 0 {
-            ui.ctx().request_repaint();
-            thumb_placeholder(ui, &p);
-            return;
-        }
-        self.thumb_budget -= 1;
-        // Lock the store only to fetch encrypted bytes; decode afterwards.
-        enum Fetch {
-            Thumb(Vec<u8>),
-            Original(Vec<u8>),
-        }
-        let fetched = {
-            let store = self.backend.store.lock().unwrap();
-            match store.thumbnail_png(&item.id) {
-                Ok(Some(thumb)) => Ok(Fetch::Thumb(thumb)),
-                Ok(None) => store.image(&item.id).map(Fetch::Original),
-                Err(e) => Err(e),
-            }
+        let job = ImageJob {
+            id: item.id.clone(),
+            kind: ImageKind::Thumbnail,
+            epoch: self.image_epoch,
         };
-        let png = match fetched {
-            Ok(Fetch::Thumb(thumb)) => thumb,
-            Ok(Fetch::Original(original)) => match crate::preview::thumbnail(&original) {
-                Ok(thumb) => {
-                    let _ = self
-                        .backend
-                        .store
-                        .lock()
-                        .unwrap()
-                        .cache_thumbnail(&item.id, &thumb);
-                    thumb
-                }
-                Err(_) => {
-                    thumb_placeholder(ui, &p);
-                    return;
-                }
-            },
-            Err(_) => {
-                thumb_placeholder(ui, &p);
-                return;
+        if !self.image_pending.contains(&job) && !self.image_failed.contains(&job) {
+            if self.thumb_budget == 0 {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(16));
+            } else {
+                self.thumb_budget -= 1;
+                self.queue_image(job, ui.ctx());
             }
-        };
-        match image::load_from_memory(&png) {
-            Ok(img) => {
-                let rgba = img.into_rgba8();
-                let size = [rgba.width() as usize, rgba.height() as usize];
-                let texture = ui.ctx().load_texture(
-                    format!("thumb-{}", item.id),
-                    egui::ColorImage::from_rgba_unmultiplied(size, &rgba),
-                    Default::default(),
-                );
-                self.thumbs.insert(item.id.clone(), texture.clone());
-                self.thumb_order.push_back(item.id.clone());
-                while self.thumbs.len() > THUMB_CACHE {
-                    match self.thumb_order.pop_front() {
-                        Some(old) => {
-                            self.thumbs.remove(&old);
-                        }
-                        None => break,
-                    }
-                }
-                ui.add(
-                    egui::Image::from_texture(&texture)
-                        .fit_to_exact_size(Vec2::new(48., 36.))
-                        .corner_radius(CornerRadius::same(4)),
-                );
-            }
-            Err(_) => thumb_placeholder(ui, &p),
         }
+        thumb_placeholder(ui, &p);
     }
 }
 fn thumb_placeholder(ui: &mut egui::Ui, p: &Palette) {
@@ -1648,6 +1836,7 @@ impl eframe::App for App {
             self.owner = std::process::id() as usize;
         }
         self.backend.window.store(self.owner, Ordering::Relaxed);
+        self.drain_images(ctx);
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Quit => {
@@ -1661,6 +1850,7 @@ impl eframe::App for App {
                     }
                     self.backend.visible.store(true, Ordering::Relaxed);
                     if queue {
+                        self.json.active = false;
                         self.calculator.leave();
                     }
                     if !self.calculator.active {
@@ -1694,12 +1884,18 @@ impl eframe::App for App {
             && !focused
             && !self.pinned
             && !self.calculator.active
+            && !self.json.active
             && !self.settings_open
             && self.confirm.is_none()
         {
             self.hide(ctx);
         }
         self.was_focused = focused;
+        self.json_window.update(ctx, self.json.active, self.owner);
+        if self.json.active {
+            self.json_page(ctx);
+            return;
+        }
         if self.calculator.active {
             self.calculator_page(ctx);
             if self.settings_open {
@@ -1716,6 +1912,13 @@ impl eframe::App for App {
         }
         self.refresh();
         let busy = self.backend.busy.load(Ordering::Relaxed);
+        if !self.settings_open
+            && self.confirm.is_none()
+            && self.enlarged_image.is_none()
+            && self.consume_find_shortcut(ctx)
+        {
+            self.focus_search = true;
+        }
         let mut navigation_active = false;
         egui::TopBottomPanel::top("brand-strip")
             .exact_height(2.)
@@ -1737,6 +1940,9 @@ impl eframe::App for App {
                 ui.label(mono("CLIBO").size(15.).strong().color(p.text));
                 ui.label(RichText::new("本地剪贴板").size(11.).color(p.text_dim));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("{ } JSON").on_hover_text("JSON 格式化与字段搜索").clicked() {
+                        self.json.active = true;
+                    }
                     if icon_button(ui, &p, "hide", false, "收起窗口 · Esc").clicked() {
                         self.hide(ctx);
                     }
@@ -2029,12 +2235,6 @@ impl eframe::App for App {
                 )
                 .show(ctx, |ui| {
                     let p = palette(self.dark);
-                    let edge = ui.max_rect();
-                    ui.painter().vline(
-                        edge.left(),
-                        egui::Rangef::new(edge.top() - 8., edge.bottom() + 8.),
-                        egui::Stroke::new(1., p.hairline),
-                    );
                     ui.add_enabled_ui(!busy && !modal, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(mono("预览").size(13.).strong().color(p.text));
@@ -2050,159 +2250,211 @@ impl eframe::App for App {
                                 },
                             );
                         });
-                        ui.add_space(4.);
-                        if let Some(texture) = &self.texture {
-                            if ui
-                                .add(
-                                    egui::Image::new(texture)
-                                        .max_size(Vec2::new(ui.available_width(), 200.))
-                                        .sense(egui::Sense::click())
-                                        .corner_radius(CornerRadius::same(4)),
-                                )
-                                .on_hover_cursor(egui::CursorIcon::ZoomIn)
-                                .on_hover_text("点击放大图片")
-                                .clicked()
-                            {
-                                self.enlarge_image(ctx);
-                            }
-                        } else {
-                            egui::Frame::default()
-                                .fill(p.input)
-                                .stroke(egui::Stroke::new(1., p.hairline))
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(egui::Margin::symmetric(8, 6))
-                                .show(ui, |ui| {
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("text-preview")
-                                        .max_height((ui.available_height() * 0.46).max(80.))
+                        egui::ScrollArea::vertical()
+                            .id_salt("preview-body")
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                            )
+                            .auto_shrink([false, false])
+                            .max_height(ui.available_height())
+                            .show(ui, |ui| {
+                                ui.add_space(4.);
+                                if let Some(texture) = &self.texture {
+                                    if ui
+                                        .add(
+                                            egui::Image::new(texture)
+                                                .max_size(Vec2::new(ui.available_width(), 200.))
+                                                .sense(egui::Sense::click())
+                                                .corner_radius(CornerRadius::same(4)),
+                                        )
+                                        .on_hover_cursor(egui::CursorIcon::ZoomIn)
+                                        .on_hover_text("点击放大图片")
+                                        .clicked()
+                                    {
+                                        self.enlarge_image(ctx);
+                                    }
+                                } else if self.preview_is_image {
+                                    egui::Frame::default()
+                                        .fill(p.input)
+                                        .stroke(egui::Stroke::new(1., p.hairline))
+                                        .corner_radius(CornerRadius::same(6))
+                                        .inner_margin(egui::Margin::symmetric(8, 18))
                                         .show(ui, |ui| {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(&self.preview_text).size(12.5),
-                                                )
-                                                .wrap()
-                                                .selectable(true),
-                                            );
+                                            ui.horizontal(|ui| {
+                                                ui.spinner();
+                                                ui.label(
+                                                    RichText::new("正在后台生成图片预览…")
+                                                        .size(11.5)
+                                                        .color(p.text_dim),
+                                                );
+                                            });
                                         });
-                                });
-                        }
-                        if self.texture.is_none() && !self.selected.is_empty() {
-                            ui.add_space(6.);
-                            section(ui, &p, "文字处理");
-                            ui.add_space(2.);
-                            let old = self.transform.clone();
-                            ui.horizontal_wrapped(|ui| {
-                                for (id, label) in [
-                                    ("original", "原文"),
-                                    ("trim", "去首尾空白"),
-                                    ("blank-lines", "合并空行"),
-                                    ("upper", "大写"),
-                                    ("lower", "小写"),
-                                    ("json", "JSON 格式化"),
-                                ] {
-                                    if pill(ui, &p, label, self.transform == id).clicked() {
-                                        self.transform = id.into();
-                                    }
+                                } else {
+                                    egui::Frame::default()
+                                        .fill(p.input)
+                                        .stroke(egui::Stroke::new(1., p.hairline))
+                                        .corner_radius(CornerRadius::same(6))
+                                        .inner_margin(egui::Margin::symmetric(8, 6))
+                                        .show(ui, |ui| {
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("text-preview")
+                                                .max_height((ui.available_height() * 0.46).max(80.))
+                                                .show(ui, |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(&self.preview_text)
+                                                                .size(12.5),
+                                                        )
+                                                        .wrap()
+                                                        .selectable(true),
+                                                    );
+                                                });
+                                        });
                                 }
-                            });
-                            if old != self.transform {
-                                let source = self
-                                    .backend
-                                    .store
-                                    .lock()
-                                    .unwrap()
-                                    .secret(&self.selected)
-                                    .ok()
-                                    .and_then(|s| s.text)
-                                    .unwrap_or_default();
-                                match crate::text_tools::transform(&source, &self.transform) {
-                                    Ok(text) => {
-                                        self.preview_text = text.chars().take(32_000).collect()
+                                if !self.preview_is_image
+                                    && self.texture.is_none()
+                                    && !self.selected.is_empty()
+                                {
+                                    ui.add_space(6.);
+                                    section(ui, &p, "文字处理");
+                                    if ui.button("在 JSON 工作页中打开 →").clicked() {
+                                        let source = self
+                                            .backend
+                                            .store
+                                            .lock()
+                                            .unwrap()
+                                            .secret(&self.selected);
+                                        match source {
+                                            Ok(secret) => {
+                                                self.json.source = secret.text.unwrap_or_default();
+                                                self.json.parse();
+                                                self.json.active = true;
+                                            }
+                                            Err(error) => self.backend.report(Err(error)),
+                                        }
                                     }
-                                    Err(e) => {
-                                        self.transform = old;
-                                        self.backend.report(Err(e));
-                                    }
-                                }
-                            }
-                        }
-                        ui.add_space(6.);
-                        section(ui, &p, "备注与分组");
-                        ui.add_space(2.);
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.note)
-                                .hint_text("备注，不会随内容粘贴")
-                                .desired_rows(2)
-                                .char_limit(1000),
-                        );
-                        let groups = self.backend.store.lock().unwrap().organizer.groups.clone();
-                        if !groups.is_empty() {
-                            ui.add_space(4.);
-                            ui.label(mono("分组").size(10.5).color(p.text_dim));
-                            egui::ScrollArea::vertical()
-                                .id_salt("memberships")
-                                .scroll_bar_visibility(
-                                    egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                                )
-                                .max_height(72.)
-                                .show(ui, |ui| {
+                                    ui.add_space(2.);
+                                    let old = self.transform.clone();
                                     ui.horizontal_wrapped(|ui| {
-                                        for g in groups {
-                                            let selected = self.memberships.contains(&g.id);
-                                            if pill(ui, &p, &g.name, selected).clicked() {
-                                                self.memberships.retain(|id| id != &g.id);
-                                                if !selected {
-                                                    self.memberships.push(g.id);
-                                                }
+                                        for (id, label) in [
+                                            ("original", "原文"),
+                                            ("trim", "去首尾空白"),
+                                            ("blank-lines", "合并空行"),
+                                            ("upper", "大写"),
+                                            ("lower", "小写"),
+                                        ] {
+                                            if pill(ui, &p, label, self.transform == id).clicked() {
+                                                self.transform = id.into();
                                             }
                                         }
                                     });
-                                });
-                        }
-                        ui.add_space(4.);
-                        let width = ui.available_width();
-                        if ui
-                            .add_sized(
-                                Vec2::new(width, 24.),
-                                egui::Button::new(
-                                    RichText::new("保存备注 / 分组")
-                                        .size(12.)
-                                        .strong()
-                                        .color(p.on_accent),
-                                )
-                                .fill(p.accent)
-                                .stroke(egui::Stroke::NONE)
-                                .corner_radius(CornerRadius::same(11)),
-                            )
-                            .clicked()
-                        {
-                            let id = self.selected.clone();
-                            let groups = self.memberships.clone();
-                            let note = self.note.clone();
-                            self.operation(|s| s.annotate(&id, &groups, &note));
-                        }
-                        ui.add_space(2.);
-                        let pinned = self
-                            .items
-                            .iter()
-                            .find(|item| item.id == self.selected)
-                            .is_some_and(|item| item.pinned);
-                        ui.horizontal(|ui| {
-                            if pill(ui, &p, if pinned { "取消收藏" } else { "收藏" }, pinned)
-                                .clicked()
-                            {
-                                let id = self.selected.clone();
-                                self.operation(|s| s.pin(&id));
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if danger_pill(ui, &p, "删除记录").clicked() {
-                                        self.confirm = Some(self.selected.clone());
+                                    if old != self.transform {
+                                        let source = self
+                                            .backend
+                                            .store
+                                            .lock()
+                                            .unwrap()
+                                            .secret(&self.selected)
+                                            .ok()
+                                            .and_then(|s| s.text)
+                                            .unwrap_or_default();
+                                        match crate::text_tools::transform(&source, &self.transform)
+                                        {
+                                            Ok(text) => {
+                                                self.preview_text =
+                                                    text.chars().take(32_000).collect()
+                                            }
+                                            Err(e) => {
+                                                self.transform = old;
+                                                self.backend.report(Err(e));
+                                            }
+                                        }
                                     }
-                                },
-                            );
-                        });
+                                }
+                                ui.add_space(6.);
+                                section(ui, &p, "备注与分组");
+                                ui.add_space(2.);
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.note)
+                                        .hint_text("备注，不会随内容粘贴")
+                                        .desired_rows(2)
+                                        .char_limit(1000),
+                                );
+                                let groups =
+                                    self.backend.store.lock().unwrap().organizer.groups.clone();
+                                if !groups.is_empty() {
+                                    ui.add_space(4.);
+                                    ui.label(mono("分组").size(10.5).color(p.text_dim));
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("memberships")
+                                        .scroll_bar_visibility(
+                                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                        )
+                                        .max_height(72.)
+                                        .show(ui, |ui| {
+                                            ui.horizontal_wrapped(|ui| {
+                                                for g in groups {
+                                                    let selected = self.memberships.contains(&g.id);
+                                                    if pill(ui, &p, &g.name, selected).clicked() {
+                                                        self.memberships.retain(|id| id != &g.id);
+                                                        if !selected {
+                                                            self.memberships.push(g.id);
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        });
+                                }
+                                ui.add_space(4.);
+                                let width = ui.available_width();
+                                if ui
+                                    .add_sized(
+                                        Vec2::new(width, 24.),
+                                        egui::Button::new(
+                                            RichText::new("保存备注 / 分组")
+                                                .size(12.)
+                                                .strong()
+                                                .color(p.on_accent),
+                                        )
+                                        .fill(p.accent)
+                                        .stroke(egui::Stroke::NONE)
+                                        .corner_radius(CornerRadius::same(11)),
+                                    )
+                                    .clicked()
+                                {
+                                    let id = self.selected.clone();
+                                    let groups = self.memberships.clone();
+                                    let note = self.note.clone();
+                                    self.operation(|s| s.annotate(&id, &groups, &note));
+                                }
+                                ui.add_space(2.);
+                                let pinned = self
+                                    .items
+                                    .iter()
+                                    .find(|item| item.id == self.selected)
+                                    .is_some_and(|item| item.pinned);
+                                ui.horizontal(|ui| {
+                                    if pill(
+                                        ui,
+                                        &p,
+                                        if pinned { "取消收藏" } else { "收藏" },
+                                        pinned,
+                                    )
+                                    .clicked()
+                                    {
+                                        let id = self.selected.clone();
+                                        self.operation(|s| s.pin(&id));
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if danger_pill(ui, &p, "删除记录").clicked() {
+                                                self.confirm = Some(self.selected.clone());
+                                            }
+                                        },
+                                    );
+                                });
+                            });
                     });
                 });
         }
@@ -2239,6 +2491,15 @@ impl eframe::App for App {
                     });
                     return;
                 }
+                if self.history_up_distance > 140. && self.history_offset > ROW_STEP * 3. {
+                    ui.horizontal(|ui| {
+                        if ui.button("↑ 回到顶部").clicked() {
+                            self.history_top = true;
+                            self.history_up_distance = 0.;
+                            self.scroll_selected = false;
+                        }
+                    });
+                }
                 let mut area = egui::ScrollArea::vertical()
                     .id_salt("history")
                     .auto_shrink([false, false]);
@@ -2248,9 +2509,13 @@ impl eframe::App for App {
                     }
                     self.scroll_selected = false;
                 }
+                if self.history_top {
+                    area = area.vertical_scroll_offset(0.);
+                    self.history_top = false;
+                }
                 let items = std::mem::take(&mut self.items);
                 self.thumb_budget = THUMB_BUDGET;
-                area.show_rows(ui, ROW_HEIGHT, items.len(), |ui, range| {
+                let history_scroll = area.show_rows(ui, ROW_HEIGHT, items.len(), |ui, range| {
                     let p = palette(self.dark);
                     for index in range {
                         let item = &items[index];
@@ -2425,6 +2690,17 @@ impl eframe::App for App {
                         });
                     }
                 });
+                let offset = history_scroll.state.offset.y;
+                let delta = self.history_offset - offset;
+                if delta > 0. {
+                    self.history_up_distance += delta;
+                } else if delta < -1. {
+                    self.history_up_distance = 0.;
+                }
+                if offset < 1. {
+                    self.history_up_distance = 0.;
+                }
+                self.history_offset = offset;
                 self.items = items;
             });
         });
@@ -2586,6 +2862,7 @@ impl App {
                             ui.add_space(2.);
                             for (slot, label, value) in [
                                 (HotkeySlot::Show, "呼出面板", self.settings.hotkey.clone()),
+                                (HotkeySlot::Find, "查找（应用内）", self.settings.find_hotkey.clone()),
                                 (
                                     HotkeySlot::Queue,
                                     "排列粘贴",
@@ -2662,6 +2939,29 @@ impl App {
                                     .desired_rows(4),
                             );
                             ui.add_space(4.);
+                            section(ui, &p, "数据安全");
+                            ui.add_space(2.);
+                            if let Some(status) =
+                                self.backend.store.lock().unwrap().recovery_status()
+                            {
+                                ui.label(RichText::new(status).size(11.).color(p.error));
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                if pill(ui, &p, "立即备份历史", false).clicked() {
+                                    self.backup_history();
+                                }
+                                if pill(ui, &p, "恢复最近备份…", false).clicked() {
+                                    self.confirm = Some("__restore__".into());
+                                    self.settings_open = false;
+                                }
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "备份保存在数据目录；恢复前会自动再保存当前历史，当前快捷键和采集设置不变。",
+                                )
+                                .size(10.5)
+                                .color(p.text_dim),
+                            );
                             ui.add_space(4.);
                             section(ui, &p, "分组管理");
                             ui.add_space(2.);
@@ -2714,43 +3014,57 @@ impl App {
             }
         }
         if let Some(id) = self.confirm.clone() {
-            egui::Window::new("确认删除")
-                .collapsible(false)
-                .resizable(false)
-                .min_width(340.)
-                .show(ctx, |ui| {
-                    let p = palette(self.dark);
-                    ui.label(if id == "__clear__" {
-                        "删除所有未收藏历史？当前排列中的对应记录也会移除。"
-                    } else {
-                        "删除这条历史及其排列引用？"
-                    });
-                    ui.add_space(4.);
-                    ui.horizontal(|ui| {
-                        if ghost(ui, "取消").clicked() {
-                            self.confirm = None;
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let on_error = if self.dark {
-                                Color32::from_rgb(0x2A, 0x0E, 0x0B)
-                            } else {
-                                Color32::WHITE
-                            };
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("确认删除")
-                                            .size(12.)
-                                            .strong()
-                                            .color(on_error),
-                                    )
-                                    .fill(p.error)
-                                    .stroke(egui::Stroke::NONE)
-                                    .corner_radius(CornerRadius::same(11))
-                                    .min_size(Vec2::new(0., 22.)),
+            let restoring = id == "__restore__";
+            egui::Window::new(if restoring {
+                "确认恢复"
+            } else {
+                "确认删除"
+            })
+            .collapsible(false)
+            .resizable(false)
+            .min_width(340.)
+            .show(ctx, |ui| {
+                let p = palette(self.dark);
+                ui.label(if restoring {
+                    "使用最近一次手动备份替换当前历史和分组？恢复前会自动创建当前历史的安全备份。"
+                } else if id == "__clear__" {
+                    "删除所有未收藏历史？当前排列中的对应记录也会移除。"
+                } else {
+                    "删除这条历史及其排列引用？"
+                });
+                ui.add_space(4.);
+                ui.horizontal(|ui| {
+                    if ghost(ui, "取消").clicked() {
+                        self.confirm = None;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let on_error = if self.dark {
+                            Color32::from_rgb(0x2A, 0x0E, 0x0B)
+                        } else {
+                            Color32::WHITE
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(if restoring {
+                                        "确认恢复"
+                                    } else {
+                                        "确认删除"
+                                    })
+                                    .size(12.)
+                                    .strong()
+                                    .color(on_error),
                                 )
-                                .clicked()
-                            {
+                                .fill(p.error)
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(CornerRadius::same(11))
+                                .min_size(Vec2::new(0., 22.)),
+                            )
+                            .clicked()
+                        {
+                            if restoring {
+                                self.restore_history();
+                            } else {
                                 self.operation(|s| {
                                     if id == "__clear__" {
                                         s.clear(false)
@@ -2758,12 +3072,13 @@ impl App {
                                         s.delete(&id)
                                     }
                                 });
-                                self.confirm = None;
                                 self.preview_id.clear();
                             }
-                        });
+                            self.confirm = None;
+                        }
                     });
                 });
+            });
         }
     }
 }
@@ -2791,6 +3106,29 @@ mod tests {
             let hotkey = HotKey::new(Some(mods), code);
             assert_eq!(HotKey::from_str(&hotkey.to_string()).unwrap(), hotkey);
         }
+    }
+
+    #[test]
+    fn find_shortcut_uses_saved_binding_and_consumes_only_matching_events() {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                command: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        let _ = ctx.run(input, |ctx| {
+            assert!(!consume_local_shortcut(ctx, "Ctrl+F"));
+            assert!(consume_local_shortcut(ctx, "Ctrl+Shift+F"));
+            assert!(!consume_local_shortcut(ctx, "Ctrl+Shift+F"));
+        });
     }
 
     #[test]

@@ -36,9 +36,12 @@ pub struct Backend {
 }
 impl Backend {
     pub fn new(store: Store, ctx: egui::Context) -> Arc<Self> {
+        let status = store
+            .recovery_status()
+            .unwrap_or_else(|| "本机加密保存 · 默认暂停记录".into());
         Arc::new(Self {
             store: Mutex::new(store),
-            status: Mutex::new("本机加密保存 · 默认暂停记录".into()),
+            status: Mutex::new(status),
             revision: AtomicU64::new(1),
             visible: AtomicBool::new(true),
             busy: AtomicBool::new(false),

@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(windows)]
+mod autostart;
 mod backend;
 mod calculator;
 #[cfg(windows)]

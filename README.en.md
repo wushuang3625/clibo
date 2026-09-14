@@ -6,7 +6,7 @@
 
 Clibo is a native local clipboard manager built with Rust and egui. It is designed for a fast, lightweight, privacy-focused clipboard history experience on Windows.
 
-Current version: **0.4.0 native preview**.
+Current version: **0.5.0 native preview**.
 
 ## Features
 
@@ -17,8 +17,10 @@ Current version: **0.4.0 native preview**.
 - A JSON workspace with validation, formatting, tree expand / collapse, nested-field search, and compact / formatted copy.
 - Global shortcuts, system tray, pinned panels, focus-loss hiding, and single-instance behavior.
 - A temporary calculator entered by typing = in the search box.
+- Timestamp conversion for seconds / milliseconds, date-time values, UTC offsets, and batches.
 - Light / dark themes and image thumbnail previews.
 - Manual history backup and restore, with a safety backup created before restoration.
+- Windows login startup without administrator privileges; Clibo can run in the tray after sign-in.
 
 ## Screenshots
 
@@ -32,7 +34,7 @@ Clipboard history, the temporary calculator, and the JSON workspace are native v
 
 ## Download
 
-Windows x64 users can download the [Clibo 0.4.0](https://github.com/wushuang3625/clibo/releases/tag/v0.4.0) portable release. Extract the archive and run Clibo.exe; Node, WebView, and other runtimes are not required.
+Windows x64 users can download the [Clibo 0.5.0](https://github.com/wushuang3625/clibo/releases/tag/v0.5.0) portable release. Extract the archive and run Clibo.exe; Node, WebView, and other runtimes are not required.
 
 ## Quick start
 

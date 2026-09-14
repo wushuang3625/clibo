@@ -35,6 +35,7 @@ mod calculator_ui;
 mod json_parser;
 mod json_ui;
 mod json_view;
+mod timestamp_ui;
 
 const ROW_HEIGHT: f32 = 64.;
 const ROW_STEP: f32 = ROW_HEIGHT + 8.;
@@ -45,6 +46,8 @@ const THUMB_BUDGET: u8 = 4;
 
 enum Event {
     Open(bool, usize),
+    OpenJson,
+    OpenTimestamp,
     Quit,
 }
 
@@ -148,6 +151,7 @@ pub struct App {
     calculator: crate::calculator::Calculator,
     json: json_ui::JsonPage,
     json_window: json_ui::WindowTransition,
+    timestamp: timestamp_ui::TimestampPage,
     filter: String,
     group: String,
     items: Vec<ClipView>,
@@ -164,6 +168,8 @@ pub struct App {
     pinned: bool,
     was_focused: bool,
     settings_open: bool,
+    #[cfg(windows)]
+    autostart: Result<bool, String>,
     settings: Settings,
     excluded: String,
     group_name: String,
@@ -315,16 +321,24 @@ pub fn run() -> Result<(), String> {
             let menu = Menu::new();
             let open = MenuItem::new("打开 Clibo", true, None);
             let queue = MenuItem::new("排列粘贴", true, None);
+            let json = MenuItem::new("JSON 工作页", true, None);
+            let timestamp = MenuItem::new("时间戳转换", true, None);
             let quit = MenuItem::new("退出", true, None);
-            menu.append_items(&[&open, &queue, &quit])?;
+            menu.append_items(&[&open, &queue, &json, &timestamp, &quit])?;
             let open_id = open.id().clone();
             let queue_id = queue.id().clone();
+            let json_id = json.id().clone();
+            let timestamp_id = timestamp.id().clone();
             let quit_id = quit.id().clone();
             let ctx = cc.egui_ctx.clone();
             let menu_backend = backend.clone();
             MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
                 if event.id == quit_id {
                     dispatch(&tx, Event::Quit, &menu_backend, &ctx);
+                } else if event.id == json_id {
+                    dispatch(&tx, Event::OpenJson, &menu_backend, &ctx);
+                } else if event.id == timestamp_id {
+                    dispatch(&tx, Event::OpenTimestamp, &menu_backend, &ctx);
                 } else if event.id == open_id || event.id == queue_id {
                     dispatch(
                         &tx,
@@ -371,6 +385,7 @@ pub fn run() -> Result<(), String> {
                 query: String::new(),
                 json: json_ui::JsonPage::initial(),
                 json_window: json_ui::WindowTransition::default(),
+                timestamp: timestamp_ui::TimestampPage::default(),
                 calculator: {
                     let mut calc = crate::calculator::Calculator::default();
                     if std::env::var_os("CLIBO_DATA_DIR").is_some()
@@ -403,6 +418,8 @@ pub fn run() -> Result<(), String> {
                 owner: 0,
                 pinned: std::env::args().any(|a| a == "--pinned" || a == "--smoke"),
                 was_focused: false,
+                #[cfg(windows)]
+                autostart: crate::autostart::enabled(),
                 settings_open: std::env::args().any(|a| a == "--smoke")
                     && std::env::args().any(|a| a == "--settings"),
                 group_name: String::new(),
@@ -1839,6 +1856,20 @@ impl eframe::App for App {
         self.drain_images(ctx);
         while let Ok(event) = self.events.try_recv() {
             match event {
+                Event::OpenJson | Event::OpenTimestamp => {
+                    self.calculator.leave();
+                    self.json.active = matches!(event, Event::OpenJson);
+                    self.timestamp.active = matches!(event, Event::OpenTimestamp);
+                    self.settings_open = false;
+                    self.hotkey_capture = None;
+                    self.confirm = None;
+                    self.enlarged_image = None;
+                    self.was_focused = false;
+                    self.backend.visible.store(true, Ordering::Relaxed);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
                 Event::Quit => {
                     self._tray = None;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1850,6 +1881,7 @@ impl eframe::App for App {
                     }
                     self.backend.visible.store(true, Ordering::Relaxed);
                     if queue {
+                        self.timestamp.active = false;
                         self.json.active = false;
                         self.calculator.leave();
                     }
@@ -1885,6 +1917,7 @@ impl eframe::App for App {
             && !self.pinned
             && !self.calculator.active
             && !self.json.active
+            && !self.timestamp.active
             && !self.settings_open
             && self.confirm.is_none()
         {
@@ -1892,6 +1925,10 @@ impl eframe::App for App {
         }
         self.was_focused = focused;
         self.json_window.update(ctx, self.json.active, self.owner);
+        if self.timestamp.active {
+            self.timestamp_page(ctx);
+            return;
+        }
         if self.json.active {
             self.json_page(ctx);
             return;
@@ -1940,13 +1977,18 @@ impl eframe::App for App {
                 ui.label(mono("CLIBO").size(15.).strong().color(p.text));
                 ui.label(RichText::new("本地剪贴板").size(11.).color(p.text_dim));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("{ } JSON").on_hover_text("JSON 格式化与字段搜索").clicked() {
+                    if ui.button("JSON").on_hover_text("JSON 格式化与字段搜索").clicked() {
                         self.json.active = true;
+                    }
+                    if ui.button("时间戳").on_hover_text("时间戳与日期时间转换").clicked() {
+                        self.timestamp.active = true;
                     }
                     if icon_button(ui, &p, "hide", false, "收起窗口 · Esc").clicked() {
                         self.hide(ctx);
                     }
                     if icon_button(ui, &p, "settings", self.settings_open, "偏好设置").clicked() {
+                        #[cfg(windows)]
+                        { self.autostart = crate::autostart::enabled(); }
                         self.settings = self.backend.store.lock().unwrap().settings.clone();
                         self.excluded = self.settings.excluded_apps.join("\n");
                         self.settings_open = true;
@@ -2116,7 +2158,6 @@ impl eframe::App for App {
                     });
             }
             ui.add_space(2.);
-            ui.separator();
         });
         // Resolve changed filters before any keyboard or pointer action this frame.
         if self.calculator.active {
@@ -2192,7 +2233,6 @@ impl eframe::App for App {
             )
             .show(ctx, |ui| {
                 let p = palette(self.dark);
-                ui.separator();
                 ui.horizontal(|ui| {
                     ui.label(
                         mono(format!("{:>4} 条", self.items.len()))
@@ -2805,6 +2845,22 @@ impl App {
                         )
                         .max_height((ctx.content_rect().height() - 160.).max(100.))
                         .show(ui, |ui| {
+                            #[cfg(windows)]
+                            {
+                                section(ui, &p, "启动");
+                                match self.autostart.clone() {
+                                    Ok(mut enabled) => {
+                                        if ui.checkbox(&mut enabled, "开机自启（立即生效）").changed() {
+                                            let result = crate::autostart::set_enabled(enabled);
+                                            self.backend.report(result);
+                                            self.autostart = crate::autostart::enabled();
+                                        }
+                                    }
+                                    Err(error) => { ui.colored_label(p.error, error); }
+                                }
+                                ui.label(RichText::new("登录 Windows 后在托盘后台运行。移动程序后请重新开启。").size(11.).color(p.text_dim));
+                                ui.add_space(8.);
+                            }
                             section(ui, &p, "采集");
                             ui.add_space(2.);
                             ui.checkbox(&mut self.settings.capture_images, "记录图片");

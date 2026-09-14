@@ -8,4 +8,5 @@ output/*.sha256
 .cache/
 test-results/
 tmp/
+.tmp-*/
 *.log

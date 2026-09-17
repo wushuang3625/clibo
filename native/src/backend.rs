@@ -60,6 +60,39 @@ impl Backend {
             self.ctx.request_repaint();
         }
     }
+    /// Read the clipboard immediately and promote its current contents to the
+    /// front of history. This complements the asynchronous OS notification:
+    /// opening the panel immediately after Copy must still select that item.
+    pub fn capture_current(&self) -> Result<Option<String>, String> {
+        let _gate = self.gate.lock().unwrap();
+        let settings = self.store.lock().unwrap().settings.clone();
+        if !settings.enabled {
+            return Ok(None);
+        }
+        let Some(capture) = platform::read(&settings)? else {
+            return Ok(None);
+        };
+        let mut store = self.store.lock().unwrap();
+        if !store.settings.enabled
+            || (!store.settings.capture_images && capture.png.is_some())
+            || (store.settings.detect_sensitive
+                && capture.text.as_deref().is_some_and(is_sensitive))
+            || store
+                .settings
+                .excluded_apps
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(&capture.source))
+        {
+            return Ok(None);
+        }
+        if !store.insert(capture)? {
+            return Ok(None);
+        }
+        let id = store.entries.first().map(|entry| entry.view.id.clone());
+        drop(store);
+        self.changed();
+        Ok(id)
+    }
     pub fn monitor(self: &Arc<Self>) {
         let this = self.clone();
         std::thread::spawn(move || {
@@ -91,36 +124,8 @@ impl Backend {
                         break;
                     }
                 }
-                let _gate = this.gate.lock().unwrap();
-                let settings = this.store.lock().unwrap().settings.clone();
-                if !settings.enabled {
-                    continue;
-                }
-                match platform::read(&settings) {
-                    Ok(Some(capture)) => {
-                        let mut store = this.store.lock().unwrap();
-                        if !store.settings.enabled
-                            || (!store.settings.capture_images && capture.png.is_some())
-                            || (store.settings.detect_sensitive
-                                && capture.text.as_deref().is_some_and(is_sensitive))
-                            || store
-                                .settings
-                                .excluded_apps
-                                .iter()
-                                .any(|s| s.eq_ignore_ascii_case(&capture.source))
-                        {
-                            continue;
-                        }
-                        let result = store.insert(capture);
-                        drop(store);
-                        match result {
-                            Ok(true) => this.changed(),
-                            Err(e) => this.report(Err(e)),
-                            _ => {}
-                        }
-                    }
-                    Err(e) => this.report(Err(e)),
-                    _ => {}
+                if let Err(error) = this.capture_current() {
+                    this.report(Err(error));
                 }
             }
         });

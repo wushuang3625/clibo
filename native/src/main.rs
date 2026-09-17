@@ -10,6 +10,7 @@ mod crypto;
 #[path = "mac_crypto.rs"]
 mod crypto;
 mod instance;
+mod launcher;
 mod model;
 #[cfg(windows)]
 mod platform;

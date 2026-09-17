@@ -78,7 +78,7 @@ impl App {
     }
 
     pub(super) fn calculator_page(&mut self, ctx: &egui::Context) {
-        let p = palette(self.dark);
+        let p = palette(self.dark, self.theme);
         let input_id = egui::Id::new("calculator-expression");
         let mut composition_event = false;
         ctx.input(|i| {
@@ -187,9 +187,13 @@ impl App {
                     .clicked()
                     {
                         self.dark = !self.dark;
-                        apply_theme(ctx, self.dark);
+                        apply_theme(ctx, self.dark, self.theme);
                         if let Ok(dir) = backend::data_dir() {
-                            UiState { dark: self.dark }.save(&dir);
+                            UiState {
+                                dark: self.dark,
+                                theme: self.theme,
+                            }
+                            .save(&dir);
                         }
                     }
                     if icon_button(ui, &p, "settings", self.settings_open, "偏好设置").clicked()

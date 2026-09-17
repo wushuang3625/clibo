@@ -12,14 +12,88 @@ pub fn now() -> i64 {
         .as_millis() as i64
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LauncherSearchPrefixes {
+    pub apps: String,
+    pub files: String,
+    pub bookmarks: String,
+    pub system: String,
+    pub google: String,
+    pub bing: String,
+    pub baidu: String,
+    pub web: String,
+    pub calculator: String,
+}
+impl Default for LauncherSearchPrefixes {
+    fn default() -> Self {
+        Self {
+            apps: "app".into(),
+            files: "file".into(),
+            bookmarks: "bm".into(),
+            system: "sys".into(),
+            google: "g".into(),
+            bing: "b".into(),
+            baidu: "bd".into(),
+            web: "web".into(),
+            calculator: "=".into(),
+        }
+    }
+}
+impl LauncherSearchPrefixes {
+    fn normalize(label: &str, value: &mut String) -> Result<(), String> {
+        *value = value.trim().to_lowercase();
+        if value.is_empty() || value.chars().count() > 12 || value.chars().any(char::is_whitespace)
+        {
+            return Err(format!("{label}搜索指令应为 1–12 个不含空格的字符"));
+        }
+        Ok(())
+    }
+    pub fn validate(&mut self) -> Result<(), String> {
+        Self::normalize("应用", &mut self.apps)?;
+        Self::normalize("文件", &mut self.files)?;
+        Self::normalize("书签", &mut self.bookmarks)?;
+        Self::normalize("系统", &mut self.system)?;
+        Self::normalize("Google", &mut self.google)?;
+        Self::normalize("Bing", &mut self.bing)?;
+        Self::normalize("百度", &mut self.baidu)?;
+        Self::normalize("网页", &mut self.web)?;
+        Self::normalize("计算", &mut self.calculator)?;
+        let values = [
+            ("应用", &self.apps),
+            ("文件", &self.files),
+            ("书签", &self.bookmarks),
+            ("系统", &self.system),
+            ("Google", &self.google),
+            ("Bing", &self.bing),
+            ("百度", &self.baidu),
+            ("网页", &self.web),
+            ("计算", &self.calculator),
+        ];
+        for (index, (label, value)) in values.iter().enumerate() {
+            if let Some((other, _)) = values[..index].iter().find(|(_, old)| *old == *value) {
+                return Err(format!("{label}搜索指令与{other}重复"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
+    pub launcher_hotkey: String,
+    pub launcher_recent: Vec<String>,
+    pub launcher_roots: Vec<String>,
+    pub launcher_bookmarks: bool,
+    pub launcher_entries: Vec<crate::launcher::Entry>,
+    pub launcher_search_prefixes: LauncherSearchPrefixes,
     pub enabled: bool,
     pub capture_images: bool,
     pub detect_sensitive: bool,
     pub max_items: usize,
     pub retention_days: i64,
+    pub json_history_max_items: usize,
     pub excluded_apps: Vec<String>,
     pub hotkey: String,
     pub queue_hotkey: String,
@@ -29,11 +103,18 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            launcher_hotkey: "Alt+S".into(),
+            launcher_recent: Vec::new(),
+            launcher_roots: Vec::new(),
+            launcher_bookmarks: true,
+            launcher_entries: Vec::new(),
+            launcher_search_prefixes: LauncherSearchPrefixes::default(),
             enabled: false,
             capture_images: true,
             detect_sensitive: true,
             max_items: 2000,
             retention_days: 30,
+            json_history_max_items: 100,
             excluded_apps: if cfg!(target_os = "macos") {
                 vec![
                     "com.1password.1password".into(),
@@ -58,11 +139,19 @@ impl Default for Settings {
 }
 impl Settings {
     pub fn validate(&mut self) -> Result<(), String> {
+        self.launcher_recent.truncate(50);
+        self.launcher_search_prefixes.validate()?;
+        if self.launcher_roots.len() > 20 {
+            return Err("最多添加 20 个搜索目录".into());
+        }
         if !(100..=2000).contains(&self.max_items) {
             return Err("历史上限应为 100–2000 条".into());
         }
         if !(1..=365).contains(&self.retention_days) {
             return Err("保留时间应为 1–365 天".into());
+        }
+        if !(10..=500).contains(&self.json_history_max_items) {
+            return Err("JSON 历史应保留 10–500 条".into());
         }
         if self.excluded_apps.len() > 100 {
             return Err("最多排除 100 个应用".into());
@@ -86,6 +175,14 @@ impl Settings {
         self.excluded_apps.dedup();
         Ok(())
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct JsonHistoryView {
+    pub id: String,
+    pub preview: String,
+    pub created_at: i64,
+    pub bytes: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -215,6 +312,7 @@ mod tests {
         assert_eq!(settings.hotkey, "Ctrl+Shift+V");
         assert_eq!(settings.queue_hotkey, "Ctrl+Alt+Q");
         assert_eq!(settings.find_hotkey, "Ctrl+F");
+        assert_eq!(settings.json_history_max_items, 100);
         let mut custom = settings;
         custom.find_hotkey = "Ctrl+Shift+F".into();
         let restored: Settings =

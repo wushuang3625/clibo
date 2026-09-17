@@ -184,6 +184,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS clips(id TEXT PRIMARY KEY,kind TEXT NOT NULL,copied_at INTEGER NOT NULL,pinned INTEGER NOT NULL,bytes INTEGER NOT NULL,secret BLOB NOT NULL,image BLOB);
             CREATE TABLE IF NOT EXISTS config(id INTEGER PRIMARY KEY CHECK(id=1),sealed BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS organizer(id INTEGER PRIMARY KEY CHECK(id=1),sealed BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS json_history(id TEXT PRIMARY KEY,created_at INTEGER NOT NULL,bytes INTEGER NOT NULL,fingerprint BLOB NOT NULL UNIQUE,sealed BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS thumbnails(id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,sealed BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS image_metadata(id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,width INTEGER NOT NULL,height INTEGER NOT NULL);").map_err(db_err)?;
         let organizer = read_organizer(&db)?;
@@ -249,6 +250,11 @@ impl Store {
             tx.execute("DELETE FROM clips WHERE id=?1", [id])
                 .map_err(db_err)?;
         }
+        tx.execute(
+            "DELETE FROM json_history WHERE id IN (SELECT id FROM json_history ORDER BY created_at DESC LIMIT -1 OFFSET ?1)",
+            [settings.json_history_max_items as i64],
+        )
+        .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         self.entries.retain(|e| !removed.contains(&e.view.id));
         self.settings = settings;
@@ -270,6 +276,86 @@ impl Store {
             None => Err("这条记录已被删除".into()),
         }
     }
+    pub fn add_json_history(&mut self, source: &str) -> Result<(), String> {
+        let source = source.trim();
+        if source.is_empty() {
+            return Ok(());
+        }
+        if source.len() > MAX_TEXT {
+            return Err("JSON 内容超过单条大小限制，未写入历史".into());
+        }
+        let fingerprint = Sha256::digest(source.as_bytes()).to_vec();
+        let sealed = crypto::protect(source.as_bytes())?;
+        let created_at = now();
+        let id = uuid::Uuid::new_v4().to_string();
+        let tx = self.db.transaction().map_err(db_err)?;
+        tx.execute(
+            "INSERT INTO json_history(id,created_at,bytes,fingerprint,sealed) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(fingerprint) DO UPDATE SET created_at=excluded.created_at,bytes=excluded.bytes,sealed=excluded.sealed",
+            params![id, created_at, source.len(), fingerprint, sealed],
+        )
+        .map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM json_history WHERE id IN (SELECT id FROM json_history ORDER BY created_at DESC LIMIT -1 OFFSET ?1)",
+            [self.settings.json_history_max_items as i64],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn json_history(&self) -> Result<Vec<JsonHistoryView>, String> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT id,created_at,bytes,sealed FROM json_history ORDER BY created_at DESC")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, usize>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut history = Vec::new();
+        for row in rows {
+            let (id, created_at, bytes, sealed) = row.map_err(db_err)?;
+            let raw = crypto::unprotect(&sealed)?;
+            let source = String::from_utf8(raw).map_err(|_| "JSON 历史内容损坏".to_string())?;
+            let compact = source
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut preview = compact.chars().take(180).collect::<String>();
+            if compact.chars().count() > 180 {
+                preview.push('…');
+            }
+            history.push(JsonHistoryView {
+                id,
+                preview,
+                created_at,
+                bytes,
+            });
+        }
+        Ok(history)
+    }
+
+    pub fn json_history_source(&self, id: &str) -> Result<String, String> {
+        let sealed: Option<Vec<u8>> = self
+            .db
+            .query_row("SELECT sealed FROM json_history WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(db_err)?;
+        let raw = crypto::unprotect(&sealed.ok_or("这条 JSON 历史已不存在")?)?;
+        String::from_utf8(raw).map_err(|_| "JSON 历史内容损坏".into())
+    }
+
     pub fn insert(&mut self, capture: Captured) -> Result<bool, String> {
         let data = capture
             .png
@@ -427,6 +513,14 @@ impl Store {
                 return Err("备份格式不完整，未执行恢复".into());
             }
         }
+        let has_json_history = source
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='json_history'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(db_err)?
+            == 1;
         drop(source);
         // Never overwrite the current history without first creating a rollback copy.
         snapshot_db(&self.db, &self.path, "history.pre-restore")
@@ -444,6 +538,9 @@ impl Store {
                 .map_err(db_err)?;
             tx.execute("DELETE FROM clips", []).map_err(db_err)?;
             tx.execute("DELETE FROM organizer", []).map_err(db_err)?;
+            if has_json_history {
+                tx.execute("DELETE FROM json_history", []).map_err(db_err)?;
+            }
             tx.execute("INSERT INTO clips(id,kind,copied_at,pinned,bytes,secret,image) SELECT id,kind,copied_at,pinned,bytes,secret,image FROM restore_src.clips", []).map_err(db_err)?;
             tx.execute(
                 "INSERT INTO organizer(id,sealed) SELECT id,sealed FROM restore_src.organizer",
@@ -456,6 +553,9 @@ impl Store {
             )
             .map_err(db_err)?;
             tx.execute("INSERT INTO image_metadata(id,width,height) SELECT id,width,height FROM restore_src.image_metadata", []).map_err(db_err)?;
+            if has_json_history {
+                tx.execute("INSERT INTO json_history(id,created_at,bytes,fingerprint,sealed) SELECT id,created_at,bytes,fingerprint,sealed FROM restore_src.json_history", []).map_err(db_err)?;
+            }
             tx.commit().map_err(db_err)?;
             Ok(())
         })();
@@ -505,14 +605,16 @@ impl Store {
             &self.settings,
             &self.organizer.protected_ids(),
         );
-        if removed.is_empty() {
-            return Ok(());
-        }
         let tx = self.db.transaction().map_err(db_err)?;
         for id in &removed {
             tx.execute("DELETE FROM clips WHERE id=?1", [id])
                 .map_err(db_err)?;
         }
+        tx.execute(
+            "DELETE FROM json_history WHERE id IN (SELECT id FROM json_history ORDER BY created_at DESC LIMIT -1 OFFSET ?1)",
+            [self.settings.json_history_max_items as i64],
+        )
+        .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         self.entries.retain(|e| !removed.contains(&e.view.id));
         Ok(())
@@ -1323,6 +1425,27 @@ mod tests {
             2
         );
     }
+    #[test]
+    fn json_history_deduplicates_and_respects_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(&dir.path().join("json-history.db")).unwrap();
+        let mut settings = s.settings.clone();
+        settings.json_history_max_items = 10;
+        s.save_settings(settings).unwrap();
+        for index in 0..12 {
+            s.add_json_history(&format!(r#"{{"index":{index}}}"#))
+                .unwrap();
+        }
+        assert_eq!(s.json_history().unwrap().len(), 10);
+        s.add_json_history(r#"{"index":11}"#).unwrap();
+        assert_eq!(s.json_history().unwrap().len(), 10);
+        let latest = s.json_history().unwrap().remove(0);
+        assert_eq!(
+            s.json_history_source(&latest.id).unwrap(),
+            r#"{"index":11}"#
+        );
+    }
+
     #[test]
     fn manual_backup_restore_keeps_current_settings_and_creates_safety_copy() {
         let dir = tempfile::tempdir().unwrap();

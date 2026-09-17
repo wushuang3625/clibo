@@ -14,10 +14,11 @@ pub(super) fn find_matches(text: &str, query: &str) -> Vec<std::ops::Range<usize
 pub(super) fn highlight_matches(
     text: &str,
     dark: bool,
+    theme: Theme,
     ranges: &[std::ops::Range<usize>],
     current: Option<&std::ops::Range<usize>>,
 ) -> egui::text::LayoutJob {
-    let mut job = highlight(text, dark);
+    let mut job = highlight(text, dark, theme);
     let sections = std::mem::take(&mut job.sections);
     for section in sections {
         let mut boundaries = vec![section.byte_range.start, section.byte_range.end];
@@ -61,7 +62,7 @@ mod search_tests {
         }
         assert_eq!(find_matches(text, "成功").len(), 1);
         assert!(find_matches(text, "").is_empty());
-        let job = highlight_matches(text, false, &found, found.first());
+        let job = highlight_matches(text, false, Theme::default(), &found, found.first());
         assert_eq!(job.text, text);
         assert_eq!(
             job.sections
@@ -73,8 +74,8 @@ mod search_tests {
     }
 }
 
-pub(super) fn highlight(text: &str, dark: bool) -> egui::text::LayoutJob {
-    let p = palette(dark);
+pub(super) fn highlight(text: &str, dark: bool, theme: Theme) -> egui::text::LayoutJob {
+    let p = palette(dark, theme);
     let key = if dark {
         Color32::from_rgb(112, 172, 255)
     } else {
@@ -144,6 +145,7 @@ pub(super) fn tree(
     key: Option<&str>,
     path: &str,
     dark: bool,
+    theme: Theme,
     collapsed: &mut HashSet<String>,
     all_closed: bool,
     comma: bool,
@@ -159,7 +161,7 @@ pub(super) fn tree(
             ui.horizontal(|ui| {
                 ui.add_space(22.);
                 ui.add(
-                    egui::Label::new(highlight(&format!("{prefix}{value}{suffix}"), dark))
+                    egui::Label::new(highlight(&format!("{prefix}{value}{suffix}"), dark, theme))
                         .selectable(true)
                         .extend(),
                 );
@@ -172,7 +174,8 @@ pub(super) fn tree(
         if ui
             .add(
                 egui::Button::new(
-                    RichText::new(if closed { "▶" } else { "▼" }).color(palette(dark).accent),
+                    RichText::new(if closed { "▶" } else { "▼" })
+                        .color(palette(dark, theme).accent),
                 )
                 .frame(false),
             )
@@ -187,7 +190,7 @@ pub(super) fn tree(
             format!("{prefix}{open}")
         };
         ui.add(
-            egui::Label::new(highlight(&line, dark))
+            egui::Label::new(highlight(&line, dark, theme))
                 .selectable(true)
                 .extend(),
         );
@@ -195,7 +198,7 @@ pub(super) fn tree(
             ui.label(
                 RichText::new(format!("{len} 项"))
                     .small()
-                    .color(palette(dark).text_dim),
+                    .color(palette(dark, theme).text_dim),
             );
         }
     });
@@ -209,6 +212,7 @@ pub(super) fn tree(
                         Some(key),
                         &format!("{path}[{}]", serde_json::to_string(key).unwrap()),
                         dark,
+                        theme,
                         collapsed,
                         all_closed,
                         index + 1 < len,
@@ -223,6 +227,7 @@ pub(super) fn tree(
                         None,
                         &format!("{path}[{index}]"),
                         dark,
+                        theme,
                         collapsed,
                         all_closed,
                         index + 1 < len,
@@ -233,7 +238,10 @@ pub(super) fn tree(
         });
         ui.horizontal(|ui| {
             ui.add_space(22.);
-            ui.add(egui::Label::new(highlight(&format!("{close}{suffix}"), dark)).selectable(true));
+            ui.add(
+                egui::Label::new(highlight(&format!("{close}{suffix}"), dark, theme))
+                    .selectable(true),
+            );
         });
     }
 }

@@ -220,7 +220,7 @@ fn output(ui: &mut egui::Ui, result: &Result<String, String>, p: &Palette) -> Op
 }
 impl App {
     pub(super) fn timestamp_page(&mut self, ctx: &egui::Context) {
-        let p = palette(self.dark);
+        let p = palette(self.dark, self.theme);
         let mut copy = None;
         if !self.timestamp.paused {
             self.timestamp.current = crate::model::now();

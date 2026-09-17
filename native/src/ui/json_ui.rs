@@ -20,6 +20,11 @@ pub(super) struct JsonPage {
     find_text: String,
     find_index: usize,
     find_scroll: bool,
+    history_open: bool,
+    history_tab: usize,
+    history_items: Vec<JsonHistoryView>,
+    history_error: String,
+    history_search: String,
 }
 
 impl JsonPage {
@@ -30,6 +35,7 @@ impl JsonPage {
             && std::env::args().any(|a| a == "--json")
         {
             page.active = true;
+            page.history_open = std::env::args().any(|a| a == "--history");
             page.source = serde_json::to_string_pretty(&serde_json::json!({
                 "event": "clipboard.exported",
                 "request_id": "demo-20260910-001",
@@ -82,6 +88,15 @@ pub(super) struct WindowTransition {
 }
 
 impl WindowTransition {
+    pub(super) fn take_original(&mut self) -> Option<egui::Rect> {
+        self.active = false;
+        let original = self
+            .original
+            .take()
+            .or_else(|| self.animation.map(|(_, _, target)| target));
+        self.animation = None;
+        original
+    }
     pub(super) fn update(&mut self, ctx: &egui::Context, active: bool, owner: usize) {
         if self.active != active {
             self.active = active;
@@ -179,8 +194,439 @@ impl App {
         };
     }
 
+    fn refresh_json_history(&mut self) {
+        let result = self.backend.store.lock().unwrap().json_history();
+        match result {
+            Ok(items) => {
+                self.json.history_items = items;
+                self.json.history_error.clear();
+            }
+            Err(error) => self.json.history_error = error,
+        }
+    }
+
+    pub(super) fn remember_json_history(&mut self) {
+        if self.json.value.is_none() || self.json.source.trim().is_empty() {
+            return;
+        }
+        let source = self.json.source.clone();
+        let result = self.backend.store.lock().unwrap().add_json_history(&source);
+        match result {
+            Ok(()) => {
+                if self.json.history_open {
+                    self.refresh_json_history();
+                }
+            }
+            Err(error) => self.json.notice = error,
+        }
+    }
+
+    fn open_json_history(&mut self) {
+        self.remember_json_history();
+        self.refresh_json_history();
+        self.json.history_open = true;
+    }
+
+    fn load_json_source(&mut self, source: String) {
+        self.json.source = source;
+        self.json.parse();
+        self.json.history_open = false;
+    }
+
+    fn history_tab_button(
+        ui: &mut egui::Ui,
+        p: &Palette,
+        label: &str,
+        active: bool,
+    ) -> egui::Response {
+        ui.add(
+            egui::Button::new(RichText::new(label).size(12.5).strong().color(if active {
+                p.accent
+            } else {
+                p.text_dim
+            }))
+            .min_size(Vec2::new(118., 32.))
+            .fill(if active { p.accent_soft } else { p.input })
+            .stroke(egui::Stroke::new(
+                1.,
+                if active { p.accent } else { p.border },
+            ))
+            .corner_radius(CornerRadius::same(8)),
+        )
+    }
+
+    fn history_row(
+        ui: &mut egui::Ui,
+        p: &Palette,
+        row_id: egui::Id,
+        time: &str,
+        tag: &str,
+        source: &str,
+        preview: &str,
+    ) -> egui::Response {
+        const ROW_HEIGHT: f32 = 72.;
+        const TIME_WIDTH: f32 = 110.;
+        const SOURCE_WIDTH: f32 = 190.;
+        const COLUMN_GAP: f32 = 18.;
+        const ARROW_WIDTH: f32 = 28.;
+
+        let width = ui.available_width();
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), egui::Sense::click());
+        let hover = ui
+            .ctx()
+            .animate_bool_with_time(row_id.with("hover"), response.hovered(), 0.08);
+        let fill = mix(p.card, p.card_hover, hover);
+        let border = mix(p.border, p.accent, hover * 0.35);
+        let corner = CornerRadius::same(8);
+        ui.painter()
+            .add(egui::Shape::rect_filled(rect, corner, fill));
+        ui.painter().add(egui::Shape::rect_stroke(
+            rect,
+            corner,
+            egui::Stroke::new(1., border),
+            egui::StrokeKind::Inside,
+        ));
+
+        let inner = rect.shrink2(Vec2::new(18., 10.));
+        let time_end = inner.left() + TIME_WIDTH;
+        let source_start = time_end + COLUMN_GAP;
+        let source_end = source_start + SOURCE_WIDTH;
+        let content_start = source_end + COLUMN_GAP;
+        let content_end = (inner.right() - ARROW_WIDTH).max(content_start);
+
+        let divider_y = egui::Rangef::new(inner.top() + 5., inner.bottom() - 5.);
+        for x in [time_end + COLUMN_GAP / 2., source_end + COLUMN_GAP / 2.] {
+            ui.painter().line_segment(
+                [egui::pos2(x, divider_y.min), egui::pos2(x, divider_y.max)],
+                egui::Stroke::new(1., p.hairline),
+            );
+        }
+
+        let time_rect = egui::Rect::from_min_max(inner.min, egui::pos2(time_end, inner.bottom()));
+        let mut time_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(row_id.with("time"))
+                .max_rect(time_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        time_ui.add(egui::Label::new(mono(time).size(11.5).color(p.text_dim)).truncate());
+
+        let source_rect = egui::Rect::from_min_max(
+            egui::pos2(source_start, inner.top()),
+            egui::pos2(source_end, inner.bottom()),
+        );
+        let mut source_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(row_id.with("source"))
+                .max_rect(source_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        kind_tag(&mut source_ui, p, tag);
+        source_ui.add_space(7.);
+        source_ui.add(
+            egui::Label::new(RichText::new(source).size(12.).strong().color(p.text)).truncate(),
+        );
+
+        let content_rect = egui::Rect::from_min_max(
+            egui::pos2(content_start, inner.top()),
+            egui::pos2(content_end, inner.bottom()),
+        );
+        let mut content_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(row_id.with("content"))
+                .max_rect(content_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let lines = preview
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(3)
+            .collect::<Vec<_>>();
+        let mut display = if lines.is_empty() {
+            "（空内容）".to_string()
+        } else {
+            lines.join("\n")
+        };
+        if display.chars().count() > 280 {
+            display = display.chars().take(279).collect();
+            display.push('…');
+        }
+        content_ui.add_sized(
+            content_rect.size(),
+            egui::Label::new(RichText::new(display).size(12.3).color(p.text)).wrap(),
+        );
+
+        ui.painter().text(
+            egui::pos2(rect.right() - 18., rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            "›",
+            egui::FontId::proportional(21.),
+            if response.hovered() {
+                p.accent
+            } else {
+                p.text_dim
+            },
+        );
+
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
+    fn json_history_page(&mut self, ctx: &egui::Context) {
+        let p = palette(self.dark, self.theme);
+        egui::TopBottomPanel::top("json-history-header")
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.panel)
+                    .inner_margin(egui::Margin::symmetric(20, 16)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("←").size(18.).color(p.text))
+                                .min_size(Vec2::new(38., 38.))
+                                .fill(p.input)
+                                .stroke(egui::Stroke::new(1., p.border))
+                                .corner_radius(CornerRadius::same(8)),
+                        )
+                        .on_hover_text("返回 JSON 工作页")
+                        .clicked()
+                    {
+                        self.json.history_open = false;
+                    }
+                    ui.add_space(8.);
+                    ui.label(mono("{ }").size(28.).strong().color(p.accent));
+                    ui.add_space(8.);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("历史记录").size(25.).strong().color(p.text));
+                        ui.add_space(1.);
+                        ui.label(
+                            RichText::new("点击一条记录，直接回到 JSON 工作页查看和编辑")
+                                .size(12.)
+                                .color(p.text_dim),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new("－")
+                                    .min_size(Vec2::new(30., 30.))
+                                    .fill(p.input)
+                                    .stroke(egui::Stroke::new(1., p.border))
+                                    .corner_radius(CornerRadius::same(7)),
+                            )
+                            .on_hover_text("最小化")
+                            .clicked()
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                    });
+                });
+                ui.add_space(14.);
+                ui.horizontal(|ui| {
+                    if Self::history_tab_button(ui, &p, "剪贴板历史", self.json.history_tab == 0)
+                        .clicked()
+                    {
+                        self.json.history_tab = 0;
+                    }
+                    ui.add_space(6.);
+                    if Self::history_tab_button(ui, &p, "JSON 历史", self.json.history_tab == 1)
+                        .clicked()
+                    {
+                        self.json.history_tab = 1;
+                        self.refresh_json_history();
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        egui::Frame::NONE
+                            .fill(p.input)
+                            .stroke(egui::Stroke::new(1., p.border))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(10, 3))
+                            .show(ui, |ui| {
+                                ui.add_sized(
+                                    Vec2::new(240., 26.),
+                                    egui::TextEdit::singleline(&mut self.json.history_search)
+                                        .frame(false)
+                                        .hint_text("搜索历史记录…"),
+                                );
+                            });
+                    });
+                });
+            });
+
+        let needle = self.json.history_search.trim().to_lowercase();
+        let clipboard_items = if self.json.history_tab == 0 {
+            self.backend
+                .store
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .filter(|entry| entry.view.kind != "image")
+                .filter(|entry| {
+                    needle.is_empty()
+                        || entry.view.preview.to_lowercase().contains(&needle)
+                        || entry.view.source.to_lowercase().contains(&needle)
+                })
+                .map(|entry| entry.view.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let json_items = if self.json.history_tab == 1 {
+            self.json
+                .history_items
+                .iter()
+                .filter(|item| needle.is_empty() || item.preview.to_lowercase().contains(&needle))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut selected_clipboard = None;
+        let mut selected_json = None;
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.panel)
+                    .inner_margin(egui::Margin::symmetric(20, 16)),
+            )
+            .show(ctx, |ui| {
+                if !self.json.history_error.is_empty() {
+                    egui::Frame::NONE
+                        .fill(p.card)
+                        .stroke(egui::Stroke::new(1., p.error))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(10)
+                        .show(ui, |ui| {
+                            ui.colored_label(p.error, &self.json.history_error);
+                        });
+                    ui.add_space(10.);
+                }
+
+                egui::ScrollArea::vertical()
+                    .id_salt("json-history-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let empty = if self.json.history_tab == 0 {
+                            clipboard_items.is_empty()
+                        } else {
+                            json_items.is_empty()
+                        };
+                        if empty && self.json.history_error.is_empty() {
+                            ui.add_space(72.);
+                            ui.vertical_centered(|ui| {
+                                ui.label(mono("{ }").size(30.).strong().color(p.accent));
+                                ui.add_space(8.);
+                                ui.label(
+                                    RichText::new(if needle.is_empty() {
+                                        if self.json.history_tab == 0 {
+                                            "还没有可用的文本剪贴板历史"
+                                        } else {
+                                            "还没有 JSON 历史"
+                                        }
+                                    } else {
+                                        "没有找到匹配的历史记录"
+                                    })
+                                    .size(14.)
+                                    .strong()
+                                    .color(p.text),
+                                );
+                                ui.add_space(4.);
+                                ui.label(
+                                    RichText::new(if self.json.history_tab == 0 {
+                                        "复制文本后会自动出现在这里"
+                                    } else {
+                                        "格式化或打开有效 JSON 后会自动记录"
+                                    })
+                                    .size(11.5)
+                                    .color(p.text_dim),
+                                );
+                            });
+                            return;
+                        }
+
+                        if self.json.history_tab == 0 {
+                            for item in &clipboard_items {
+                                let source = if item.source.trim().is_empty() {
+                                    "未知来源"
+                                } else {
+                                    item.source.as_str()
+                                };
+                                let tag = if item.kind == "link" { "URL" } else { "TXT" };
+                                let response = Self::history_row(
+                                    ui,
+                                    &p,
+                                    egui::Id::new(("clipboard-history-row", &item.id)),
+                                    &time_label(item.copied_at),
+                                    tag,
+                                    source,
+                                    &item.preview,
+                                );
+                                if response.clicked() {
+                                    selected_clipboard = Some(item.id.clone());
+                                }
+                                ui.add_space(9.);
+                            }
+                        } else {
+                            for item in &json_items {
+                                let source =
+                                    format!("JSON 工作页 · {:.1} KB", item.bytes as f64 / 1024.);
+                                let response = Self::history_row(
+                                    ui,
+                                    &p,
+                                    egui::Id::new(("json-history-row", &item.id)),
+                                    &time_label(item.created_at),
+                                    "JSON",
+                                    &source,
+                                    &item.preview,
+                                );
+                                if response.clicked() {
+                                    selected_json = Some(item.id.clone());
+                                }
+                                ui.add_space(9.);
+                            }
+                        }
+                    });
+            });
+
+        if let Some(id) = selected_clipboard {
+            let source = self
+                .backend
+                .store
+                .lock()
+                .unwrap()
+                .secret(&id)
+                .and_then(|secret| {
+                    secret
+                        .text
+                        .ok_or_else(|| "这条剪贴板记录没有文本内容".into())
+                });
+            match source {
+                Ok(source) => {
+                    self.load_json_source(source);
+                    self.remember_json_history();
+                }
+                Err(error) => self.json.history_error = error,
+            }
+        } else if let Some(id) = selected_json {
+            let source = self.backend.store.lock().unwrap().json_history_source(&id);
+            match source {
+                Ok(source) => self.load_json_source(source),
+                Err(error) => self.json.history_error = error,
+            }
+        }
+    }
+
     pub(super) fn json_page(&mut self, ctx: &egui::Context) {
-        let p = palette(self.dark);
+        if self.json.history_open {
+            self.json_history_page(ctx);
+            return;
+        }
+        let p = palette(self.dark, self.theme);
         let focus_find = self.consume_find_shortcut(ctx);
         if focus_find {
             self.json.find_open = true;
@@ -200,6 +646,7 @@ impl App {
                 ui.spacing_mut().button_padding = Vec2::new(12., 7.);
                 ui.horizontal(|ui| {
                     if ui.button("←").clicked() {
+                        self.remember_json_history();
                         self.json.active = false;
                         self.focus_search = true;
                         self.dirty = true;
@@ -233,7 +680,11 @@ impl App {
                             if let Ok(value) = super::json_parser::parse(&self.json.source) {
                                 self.json.source = serde_json::to_string_pretty(&value).unwrap();
                             }
+                            self.remember_json_history();
                         }
+                    }
+                    if ui.button("历史记录").clicked() {
+                        self.open_json_history();
                     }
                     if ui
                         .add_enabled(
@@ -254,6 +705,7 @@ impl App {
                         self.copy_json_text(&self.json.value.as_ref().unwrap().to_string());
                     }
                     if ui.button("清空").clicked() {
+                        self.remember_json_history();
                         self.json = JsonPage {
                             active: true,
                             ..Default::default()
@@ -400,13 +852,14 @@ impl App {
                             ui.horizontal_top(|ui| {
                                 let count = self.json.source.split('\n').count();
                                 let numbers = (1..=count).map(|n| format!("{n:>3}")).collect::<Vec<_>>().join("\n");
-                                let mut job = super::json_view::highlight(&numbers, self.dark);
+                                let mut job = super::json_view::highlight(&numbers, self.dark, self.theme);
                                 for section in &mut job.sections { section.format.color = p.text_dim; }
                                 ui.add(egui::Label::new(job).selectable(false).extend());
                                 ui.separator();
                                 let dark = self.dark;
+                                let theme = self.theme;
                                 let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _width: f32| {
-                                    ui.fonts_mut(|fonts| fonts.layout_job(super::json_view::highlight(text.as_str(), dark)))
+                                    ui.fonts_mut(|fonts| fonts.layout_job(super::json_view::highlight(text.as_str(), dark, theme)))
                                 };
                                 let response = ui.add(egui::TextEdit::multiline(&mut self.json.source).code_editor().frame(false).margin(egui::Margin::ZERO).hint_text("在这里粘贴 JSON 或单引号字典…").desired_width(ui.available_width().max(200.)).desired_rows(25).layouter(&mut layouter));
                                 if response.changed() { self.json.parse(); }
@@ -442,7 +895,7 @@ impl App {
                                         let end = start + line.len();
                                         let ranges: Vec<_> = matches.iter().filter(|r| r.start >= start && r.end <= end).map(|r| (r.start - start)..(r.end - start)).collect();
                                         let selected = current.is_some_and(|r| r.start >= start && r.start <= end);
-                                        let local_current = current.filter(|_| selected).map(|r| (r.start - start)..(r.end - start)); let job = super::json_view::highlight_matches(line, self.dark, &ranges, local_current.as_ref());
+                                        let local_current = current.filter(|_| selected).map(|r| (r.start - start)..(r.end - start)); let job = super::json_view::highlight_matches(line, self.dark, self.theme, &ranges, local_current.as_ref());
                                         let response = ui.add(egui::Label::new(job).selectable(true).extend());
                                         if selected && self.json.find_scroll { response.scroll_to_me(Some(egui::Align::Center)); }
                                         start = end + 1;
@@ -458,12 +911,12 @@ impl App {
                                                 }
                                                 ui.label(RichText::new(&path).monospace().color(p.accent));
                                             });
-                                            ui.add(egui::Label::new(super::json_view::highlight(&summary, self.dark)).selectable(true));
+                                            ui.add(egui::Label::new(super::json_view::highlight(&summary, self.dark, self.theme)).selectable(true));
                                             ui.separator();
                                         });
                                     }
                                 } else {
-                                    super::json_view::tree(ui, value, None, "$", self.dark, &mut self.json.collapsed, self.json.all_closed, false);
+                                    super::json_view::tree(ui, value, None, "$", self.dark, self.theme, &mut self.json.collapsed, self.json.all_closed, false);
                                 }
                             });
                         });

@@ -486,7 +486,10 @@ mod tests {
     fn packaged_entry_filters_shortcuts_and_grouping_folders() {
         let good = super::packaged_entry("ChatGPT", "OpenAI.ChatGPT_2p2nqsd0c76g0!App").unwrap();
         assert_eq!(good.name, "ChatGPT");
-        assert_eq!(good.target, "shell:AppsFolder\\OpenAI.ChatGPT_2p2nqsd0c76g0!App");
+        assert_eq!(
+            good.target,
+            "shell:AppsFolder\\OpenAI.ChatGPT_2p2nqsd0c76g0!App"
+        );
         assert!(super::packaged_entry("", "pkg!app").is_none());
         // 分组文件夹与普通快捷方式的解析名不带 '!'。
         assert!(super::packaged_entry("记事本", "notepad.exe").is_none());
@@ -533,7 +536,10 @@ mod tests {
                 guid.data4[7],
             )
         }
-        assert_eq!(text(&super::IID_SHELL_ITEM), "43826D1E-E718-42EE-BC55-A1E261C37BFE");
+        assert_eq!(
+            text(&super::IID_SHELL_ITEM),
+            "43826D1E-E718-42EE-BC55-A1E261C37BFE"
+        );
         assert_eq!(
             text(&super::IID_ENUM_SHELL_ITEMS),
             "70629033-E363-4A28-A567-0DB78006E6D7"

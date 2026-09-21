@@ -368,8 +368,7 @@ mod tests {
     fn hotkeys_use_the_same_flat_wire_keys_as_before_the_grouping() {
         // 0.6.x 写出的扁平键名必须原样读入，且重新写出的 JSON 键名保持不变，
         // 这样旧库无需迁移、降级回旧版本也不会丢失自定义快捷键。
-        let legacy =
-            r#"{"hotkey":"Ctrl+Alt+K","queueHotkey":"Ctrl+Alt+Q","findHotkey":"Ctrl+Shift+F","jsonHotkey":"Ctrl+J","timestampHotkey":"Ctrl+T","launcherHotkey":"Alt+Space"}"#;
+        let legacy = r#"{"hotkey":"Ctrl+Alt+K","queueHotkey":"Ctrl+Alt+Q","findHotkey":"Ctrl+Shift+F","jsonHotkey":"Ctrl+J","timestampHotkey":"Ctrl+T","launcherHotkey":"Alt+Space"}"#;
         let settings: Settings = serde_json::from_str(legacy).unwrap();
         assert_eq!(settings.hotkeys.summon, "Ctrl+Alt+K");
         assert_eq!(settings.hotkeys.queue, "Ctrl+Alt+Q");

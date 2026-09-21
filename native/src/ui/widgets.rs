@@ -1,6 +1,6 @@
 //! 自绘小组件：精确的矢量几何与配色，替代 egui 默认控件样式。
-use eframe::egui::{self, Color32, CornerRadius, RichText, Vec2};
 use super::theme::Palette;
+use eframe::egui::{self, Color32, CornerRadius, RichText, Vec2};
 
 /// Monospace helper for metadata, counters and keyboard hints.
 pub(crate) fn mono(text: impl Into<String>) -> RichText {
@@ -337,7 +337,12 @@ where
     });
 }
 /// Grouped card with a small caps header, matching the settings redesign.
-pub(crate) fn settings_card(ui: &mut egui::Ui, p: &Palette, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+pub(crate) fn settings_card(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    title: &str,
+    add: impl FnOnce(&mut egui::Ui),
+) {
     egui::Frame::default()
         .fill(p.card)
         .stroke(egui::Stroke::new(1., p.hairline))

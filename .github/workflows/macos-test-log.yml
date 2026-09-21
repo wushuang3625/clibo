@@ -1,0 +1,29 @@
+name: Capture macOS test output (temporary)
+
+on:
+  push:
+    paths: ['.github/workflows/macos-test-log.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  testlog:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: arena/01a0c1c5-clibo
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - run: |
+          set +e
+          cargo test --locked --manifest-path native/Cargo.toml > test-output.txt 2>&1
+          echo "cargo test exit code: $?" >> test-output.txt
+      - run: |
+          git config user.name "clibo-debug-bot"
+          git config user.email "debug-bot@localhost"
+          git add test-output.txt
+          git commit -m "macOS cargo test output (temporary debug)"
+          git push

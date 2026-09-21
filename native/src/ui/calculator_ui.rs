@@ -189,11 +189,7 @@ impl App {
                         self.dark = !self.dark;
                         apply_theme(ctx, self.dark, self.theme);
                         if let Ok(dir) = backend::data_dir() {
-                            UiState {
-                                dark: self.dark,
-                                theme: self.theme,
-                            }
-                            .save(&dir);
+                            UiState::of(self).save(&dir);
                         }
                     }
                     if icon_button(ui, &p, "settings", self.settings_open, "偏好设置").clicked()

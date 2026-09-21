@@ -6,7 +6,7 @@
 
 Clibo is a native local clipboard manager built with Rust and egui. It is designed for a fast, lightweight, privacy-focused clipboard history experience on Windows.
 
-Current version: **0.5.0 native preview**.
+Current version: **0.6.0 native preview**.
 
 ## Features
 
@@ -40,7 +40,7 @@ The clipboard panel, JSON workspace, launcher, calculator, timestamp converter, 
 
 ## Download
 
-Windows x64 users can download the [Clibo 0.5.0](https://github.com/wushuang3625/clibo/releases/tag/v0.5.0) portable release. Extract the archive and run Clibo.exe; Node, WebView, and other runtimes are not required.
+Windows x64 users can download the [Clibo 0.6.0](https://github.com/wushuang3625/clibo/releases/tag/v0.6.0) portable release. Extract the archive and run Clibo.exe; Node, WebView, and other runtimes are not required.
 
 ## Quick start
 
@@ -48,8 +48,8 @@ Windows x64 users can download the [Clibo 0.5.0](https://github.com/wushuang3625
 2. Copy text, links, or images in any application.
 3. Press Ctrl + Shift + V to open Clibo.
 4. Search and select an entry. Press Enter to try pasting, or Shift + Enter to copy only.
-5. Type > in the search box to enter command mode and open the JSON workspace, timestamp converter, launcher, or preferences.
-6. Change the panel and queue shortcuts in Preferences.
+5. Type > or the full-width 》 in the search box to enter command mode and open the JSON workspace, timestamp converter, launcher, or preferences.
+6. Change the panel, queue, and launcher shortcuts in Preferences. The "In panel" group records JSON workspace and timestamp converter shortcuts that only apply while the Clibo window is active. Pressing Ctrl + Shift + V always returns to the clipboard page.
 
 ## Launcher
 
@@ -64,6 +64,7 @@ Press **Alt + S** to open the compact floating search box; you can also type > i
 | `bm name` | Search local Chrome, Edge, Brave, and Firefox bookmarks |
 | `g keyword` / `b keyword` / `bd keyword` | Google / Bing / Baidu web search; the browser opens only after execution |
 | `= 12*3` or `12*3` | Local calculation; Enter copies the result |
+| `> ` / `》 ` | List only Clibo built-in tools: clipboard history, JSON workspace, timestamp converter, preferences, index refresh |
 | `sys keyword` | Windows settings, Task Manager, Recycle Bin, lock, shutdown, restart, and Clibo built-in tools |
 | `https://example.com` | Open the URL |
 
@@ -85,7 +86,7 @@ Default data locations:
 - Windows: %LOCALAPPDATA%\local.clibo.native\history.db
 - macOS: ~/Library/Application Support/local.clibo.native/history.db
 
-The UI theme state is stored as ui-state.json in the same directory. Clipboard text, sources, images, and settings are stored in a local encrypted database: DPAPI on Windows, and AES-256-GCM with the system Keychain on macOS. Clibo does not upload clipboard contents.
+The UI theme and preview panel state are stored as ui-state.json in the same directory. Clipboard text, sources, images, and settings are stored in a local encrypted database: DPAPI on Windows, and AES-256-GCM with the system Keychain on macOS. Clibo does not upload clipboard contents.
 
 For isolated tests or demos, set CLIBO_DATA_DIR to a separate directory:
 

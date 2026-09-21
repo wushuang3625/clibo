@@ -98,6 +98,8 @@ pub struct Settings {
     pub hotkey: String,
     pub queue_hotkey: String,
     pub find_hotkey: String,
+    pub json_hotkey: String,
+    pub timestamp_hotkey: String,
     pub autostart: bool,
 }
 impl Default for Settings {
@@ -133,6 +135,9 @@ impl Default for Settings {
             hotkey: "Ctrl+Shift+V".into(),
             queue_hotkey: "Ctrl+Alt+Q".into(),
             find_hotkey: "Ctrl+F".into(),
+            // 面板激活时生效，默认未设置，可在偏好设置中录入。
+            json_hotkey: String::new(),
+            timestamp_hotkey: String::new(),
             autostart: false,
         }
     }

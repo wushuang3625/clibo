@@ -6,7 +6,7 @@
 
 Clibo 是一款基于 Rust + egui 构建的原生本地剪贴板管理工具，面向 Windows 提供快捷、轻量且注重隐私的剪贴板历史管理体验。
 
-当前版本：**0.5.0 原生预览版**。
+当前版本：**0.6.0 原生预览版**。
 
 ## 功能
 
@@ -40,7 +40,7 @@ Clibo 是一款基于 Rust + egui 构建的原生本地剪贴板管理工具，�
 
 ## 下载
 
-Windows x64 用户可以直接下载 [Clibo 0.5.0](https://github.com/wushuang3625/clibo/releases/tag/v0.5.0) 便携版。解压后运行 Clibo.exe，不需要 Node、WebView 或其他运行时。
+Windows x64 用户可以直接下载 [Clibo 0.6.0](https://github.com/wushuang3625/clibo/releases/tag/v0.6.0) 便携版。解压后运行 Clibo.exe，不需要 Node、WebView 或其他运行时。
 
 ## 快速使用
 
@@ -48,8 +48,8 @@ Windows x64 用户可以直接下载 [Clibo 0.5.0](https://github.com/wushuang36
 2. 在任意应用中复制文字、链接或图片。
 3. 按 Ctrl + Shift + V 呼出 Clibo。
 4. 搜索并选择记录，按 Enter 尝试粘贴，按 Shift + Enter 仅复制。
-5. 在搜索框输入 > 进入工具命令模式，可打开 JSON 工作页、时间戳转换、启动器和偏好设置。
-6. 在偏好设置中可以修改呼出和排列粘贴快捷键。
+5. 在搜索框输入 > 或全角 》 进入工具命令模式，可打开 JSON 工作页、时间戳转换、启动器和偏好设置。
+6. 在偏好设置中可以修改呼出、排列粘贴和启动器快捷键；“面板内”分组可录入 JSON 工作页与时间戳转换快捷键，仅在 Clibo 窗口激活时生效。按 Ctrl + Shift + V 呼出时始终回到剪贴板页。
 7. Windows 用户可在偏好设置的“启动”区域开启“开机自启”，登录后自动在托盘后台运行。开关立即生效，无需管理员权限；移动便携版程序后请关闭再重新开启。
 
 ## 启动器
@@ -65,6 +65,7 @@ Windows x64 用户可以直接下载 [Clibo 0.5.0](https://github.com/wushuang36
 | `bm 名称` | 搜索 Chrome、Edge、Brave 和 Firefox 本地书签 |
 | `g 关键词` / `b 关键词` / `bd 关键词` | Google / Bing / 百度网页搜索；仅在执行后打开浏览器 |
 | `= 12*3` 或 `12*3` | 本地计算，回车复制结果 |
+| `> ` / `》 ` | 仅列出 Clibo 内置工具：剪贴板历史、JSON 工作页、时间戳转换、偏好设置、刷新索引 |
 | `sys 关键词` | Windows 设置、任务管理器、回收站、锁屏、关机、重启，以及 Clibo 内置工具 |
 | `https://example.com` | 打开网址 |
 
@@ -86,7 +87,7 @@ macOS 保留应用目录与本地文件搜索路径；Windows 系统操作及浏
 - Windows：%LOCALAPPDATA%\local.clibo.native\history.db
 - macOS：~/Library/Application Support/local.clibo.native/history.db
 
-界面主题状态保存在同一目录下的 ui-state.json。剪贴板正文、来源、图片和设置保存在本地加密数据库中：Windows 使用 DPAPI，macOS 使用 AES-256-GCM 和系统钥匙串。Clibo 不上传剪贴板内容。
+界面主题与预览面板状态保存在同一目录下的 ui-state.json。剪贴板正文、来源、图片和设置保存在本地加密数据库中：Windows 使用 DPAPI，macOS 使用 AES-256-GCM 和系统钥匙串。Clibo 不上传剪贴板内容。
 
 测试或演示时可以使用 CLIBO_DATA_DIR 指定独立数据目录：
 

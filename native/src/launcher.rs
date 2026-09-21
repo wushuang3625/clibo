@@ -19,7 +19,7 @@ impl Entry {
         if self.target.contains(['\0', '\n', '\r']) {
             return Err("目标包含无效字符".into());
         }
-        if is_web_url(&self.target) {
+        if is_web_url(&self.target) || is_app_reference(&self.target) {
             return Ok(());
         } else if !Path::new(&self.target).is_absolute() || !Path::new(&self.target).exists() {
             return Err("请选择存在的文件或文件夹，并填写完整路径（不附带命令参数）".into());
@@ -98,6 +98,9 @@ pub fn discover() -> Vec<Entry> {
     for root in roots {
         scan(&root, 0, &mut entries);
     }
+    // Microsoft Store apps live in the shell:AppsFolder namespace instead of the Start Menu.
+    #[cfg(windows)]
+    entries.extend(windows::store_apps());
     entries.sort_by_key(|entry| (entry.name.to_lowercase(), entry.target.to_lowercase()));
     entries.dedup_by(|a, b| a.target.eq_ignore_ascii_case(&b.target));
     entries
@@ -115,6 +118,17 @@ pub fn is_web_url(target: &str) -> bool {
     !host.is_empty() && !target.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+/// Recognizes packaged app targets like `shell:AppsFolder\PackageFamily!ApplicationId`.
+pub fn is_app_reference(target: &str) -> bool {
+    target
+        .strip_prefix("shell:AppsFolder\\")
+        .is_some_and(|aumid| {
+            !aumid.is_empty()
+                && aumid.contains('!')
+                && !aumid.chars().any(|c| c.is_whitespace() || c.is_control())
+        })
+}
+
 pub fn launch(entry: &Entry) -> Result<(), String> {
     launch_as(entry, false)
 }
@@ -122,6 +136,9 @@ pub fn launch_as(entry: &Entry, admin: bool) -> Result<(), String> {
     entry.validate()?;
     #[cfg(windows)]
     {
+        if is_app_reference(&entry.target) {
+            return windows::activate_app(&entry.target);
+        }
         windows::open(&entry.target, admin)
     }
     #[cfg(not(windows))]
@@ -233,6 +250,16 @@ mod tests {
             "cmd /c calc",
             "javascript:alert(1)",
             "https://a\0",
+        ] {
+            entry.target = target.into();
+            assert!(entry.validate().is_err(), "{target}");
+        }
+        entry.target = "shell:AppsFolder\\OpenAI.ChatGPT_2p2nqsd0c76g0!App".into();
+        assert!(entry.validate().is_ok());
+        for target in [
+            "shell:AppsFolder\\",
+            "shell:AppsFolder\\notepad",
+            "shell:AppsFolder\\a!b c",
         ] {
             entry.target = target.into();
             assert!(entry.validate().is_err(), "{target}");

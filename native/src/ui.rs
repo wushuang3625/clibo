@@ -44,6 +44,7 @@ const ROW_STEP: f32 = ROW_HEIGHT + 8.;
 const THUMB_CACHE: usize = 24;
 /// Maximum row thumbnail jobs queued per frame; decoding happens off the UI thread.
 const THUMB_BUDGET: u8 = 4;
+const APP_CORNER_RADIUS: u8 = 14;
 
 enum Event {
     Open(bool, usize, Option<String>),
@@ -157,6 +158,8 @@ enum HotkeySlot {
     Queue,
     Find,
     Launcher,
+    Json,
+    Timestamp,
 }
 /// `>` 命令模式里的一个工具条目。
 struct CommandItem {
@@ -203,7 +206,9 @@ impl SettingsSection {
             SettingsSection::Launcher => {
                 "启动器 搜索范围 书签 搜索目录 搜索指令 前缀 应用 文件 网页 计算"
             }
-            SettingsSection::Hotkeys => "快捷键 呼出面板 排列粘贴 队列 启动器 查找 重录",
+            SettingsSection::Hotkeys => {
+                "快捷键 呼出面板 排列粘贴 队列 启动器 查找 重录 JSON 时间戳"
+            }
             SettingsSection::Data => "数据 备份 恢复 清理",
         }
     }
@@ -270,6 +275,8 @@ pub struct App {
     transform: String,
     confirm: Option<String>,
     preview_open: bool,
+    /// 预览抽屉的持久偏好（设置开关与 Ctrl+P 共用）；选中图片时不再强行覆盖它。
+    preview_default: bool,
     ime_composing: bool,
     smoke: Option<std::time::Instant>,
     screenshot_requested: bool,
@@ -381,16 +388,17 @@ pub fn run() -> Result<(), String> {
             })
             .with_title("Clibo · Native")
             .with_decorations(false)
+            .with_transparent(true)
             .with_inner_size(
                 if std::env::args().any(|a| a == "--smoke")
                     && std::env::args().any(|a| a == "--small")
                 {
-                    [620., 440.]
+                    [560., 440.]
                 } else {
-                    [780., 580.]
+                    [660., 580.]
                 },
             )
-            .with_min_inner_size([620., 440.])
+            .with_min_inner_size([560., 440.])
             .with_always_on_top(),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
@@ -609,7 +617,8 @@ pub fn run() -> Result<(), String> {
                 image_actual_size: false,
                 transform: "original".into(),
                 confirm: None,
-                preview_open: true,
+                preview_open: ui_state.preview_open,
+                preview_default: ui_state.preview_open,
                 ime_composing: false,
                 smoke: std::env::args()
                     .any(|a| a == "--smoke")
@@ -745,8 +754,21 @@ struct UiState {
     dark: bool,
     #[serde(default)]
     theme: Theme,
+    // 历史默认值是打开；serde(default) 给 false，需要 default_preview_open 兜底。
+    #[serde(default = "default_preview_open")]
+    preview_open: bool,
+}
+fn default_preview_open() -> bool {
+    true
 }
 impl UiState {
+    fn of(app: &App) -> Self {
+        Self {
+            dark: app.dark,
+            theme: app.theme,
+            preview_open: app.preview_default,
+        }
+    }
     fn load(dir: &Path) -> Self {
         std::fs::read(dir.join("ui-state.json"))
             .ok()
@@ -806,17 +828,19 @@ fn apply_theme(ctx: &egui::Context, dark: bool, theme: Theme) {
     visuals.widgets.noninteractive.bg_fill = p.panel;
     visuals.widgets.noninteractive.bg_stroke.color = p.hairline;
     visuals.widgets.noninteractive.fg_stroke.color = p.text_dim;
-    visuals.window_corner_radius = CornerRadius::same(8);
+    visuals.window_corner_radius = CornerRadius::same(APP_CORNER_RADIUS);
     visuals.menu_corner_radius = CornerRadius::same(6);
     let shadow_alpha = if dark { 90 } else { 40 };
-    let shadow = egui::Shadow {
+    visuals.popup_shadow = egui::Shadow {
         offset: [0, 3],
         blur: 14,
         spread: 0,
         color: Color32::from_black_alpha(shadow_alpha),
     };
-    visuals.window_shadow = shadow;
-    visuals.popup_shadow = shadow;
+    // 圆角窗口不需要投影：设置等 egui 窗口与外层页面边缘保持一致的圆角。
+    visuals.window_shadow = egui::Shadow::NONE;
+    // 页面背景由无框主窗口统一绘制圆角底色，各面板保持透明。
+    visuals.panel_fill = Color32::TRANSPARENT;
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = Vec2::new(9., 7.);
     style.spacing.button_padding = Vec2::new(10., 5.);
@@ -1273,13 +1297,24 @@ fn setting_row(
     desc: &str,
     control: impl FnOnce(&mut egui::Ui),
 ) {
+    setting_row_sized(ui, p, title, desc, 170., control)
+}
+/// Same row with a custom reserved control width for wider controls (e.g. hotkey chips).
+fn setting_row_sized(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    title: &str,
+    desc: &str,
+    control_width: f32,
+    control: impl FnOnce(&mut egui::Ui),
+) {
     egui::Frame::default()
         .inner_margin(egui::Margin::symmetric(14, 11))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.set_width((ui.available_width() - 170.).max(200.));
+                    ui.set_width((ui.available_width() - control_width).max(200.));
                     ui.label(RichText::new(title).size(12.8).color(p.text));
                     if !desc.is_empty() {
                         ui.label(RichText::new(desc).size(10.8).color(p.text_dim));
@@ -1572,6 +1607,39 @@ fn consume_local_shortcut(ctx: &egui::Context, raw: &str) -> bool {
 }
 
 impl App {
+    /// 面板激活时生效的页面快捷键（JSON / 时间戳），返回 true 表示本帧已消费按键。
+    fn consume_page_shortcuts(&mut self, ctx: &egui::Context) -> bool {
+        if self.hotkey_capture.is_some() || self.ime_composing {
+            return false;
+        }
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
+        if !focused {
+            return false;
+        }
+        let settings = self.backend.store.lock().unwrap().settings.clone();
+        for (raw, json) in [
+            (&settings.json_hotkey, true),
+            (&settings.timestamp_hotkey, false),
+        ] {
+            if !raw.is_empty() && consume_local_shortcut(ctx, raw) {
+                self.calculator.leave();
+                self.launcher.active = false;
+                self.json.active = json;
+                self.timestamp.active = !json;
+                self.settings_open = false;
+                self.confirm = None;
+                self.enlarged_image = None;
+                if json {
+                    self.json.find_open = false;
+                    self.json.history_open = false;
+                }
+                self.focus_search = true;
+                self.dirty = true;
+                return true;
+            }
+        }
+        false
+    }
     fn consume_find_shortcut(&self, ctx: &egui::Context) -> bool {
         if self.hotkey_capture.is_some() || self.ime_composing {
             return false;
@@ -1907,6 +1975,15 @@ fn time_label(copied_at: i64) -> String {
 }
 
 impl App {
+    /// 预览抽屉的统一写入路径：设置开关与 Ctrl+P 都走这里，改动立即持久化，
+    /// 呼出面板时不会回到旧状态。
+    fn set_preview(&mut self, open: bool) {
+        self.preview_open = open;
+        self.preview_default = open;
+        if let Ok(dir) = backend::data_dir() {
+            UiState::of(self).save(&dir);
+        }
+    }
     fn hide(&mut self, ctx: &egui::Context) {
         if self._tray.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -2140,7 +2217,7 @@ impl App {
         self.memberships = memberships;
         self.preview_is_image = is_image;
         if is_image {
-            // 选中图片行时自动展开预览抽屉，直接看到大图。
+            // 图片行始终自动展开预览抽屉，直接看到大图；下次呼出面板时按偏好复位。
             self.preview_open = true;
             if let Some(texture) = self.thumbs.get(&selected).cloned() {
                 self.texture = Some(texture);
@@ -2229,7 +2306,11 @@ impl App {
             },
             pause,
         ];
-        let filter = self.query.trim_start_matches('>').trim().to_lowercase();
+        let filter = self
+            .query
+            .trim_start_matches(['>', '＞'])
+            .trim()
+            .to_lowercase();
         if filter.is_empty() {
             return all;
         }
@@ -2767,6 +2848,8 @@ impl App {
             (HotkeySlot::Queue, &self.settings.queue_hotkey),
             (HotkeySlot::Find, &self.settings.find_hotkey),
             (HotkeySlot::Launcher, &self.settings.launcher_hotkey),
+            (HotkeySlot::Json, &self.settings.json_hotkey),
+            (HotkeySlot::Timestamp, &self.settings.timestamp_hotkey),
         ]
         .iter()
         .any(|(other_slot, other)| {
@@ -2781,6 +2864,8 @@ impl App {
             HotkeySlot::Queue => self.settings.queue_hotkey = hotkey.to_string(),
             HotkeySlot::Find => self.settings.find_hotkey = hotkey.to_string(),
             HotkeySlot::Launcher => self.settings.launcher_hotkey = hotkey.to_string(),
+            HotkeySlot::Json => self.settings.json_hotkey = hotkey.to_string(),
+            HotkeySlot::Timestamp => self.settings.timestamp_hotkey = hotkey.to_string(),
         }
         self.hotkey_capture = None;
         self.capture_error.clear();
@@ -2858,6 +2943,10 @@ fn resize_border(ctx: &egui::Context) {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        Color32::TRANSPARENT.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if let Some(started) = self.smoke {
             let screenshot = ctx.input(|i| {
@@ -2916,6 +3005,13 @@ impl eframe::App for App {
         }
         self.backend.window.store(self.owner, Ordering::Relaxed);
         self.drain_images(ctx);
+        // 无边框主窗口：在透明背景上绘制圆角底色，让剪贴板、启动器、JSON、
+        // 时间戳各页面与设置窗口保持一致的圆角。
+        ctx.layer_painter(egui::LayerId::background()).rect_filled(
+            ctx.content_rect(),
+            CornerRadius::same(APP_CORNER_RADIUS),
+            palette(self.dark, self.theme).panel,
+        );
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::OpenJson
@@ -2969,11 +3065,11 @@ impl eframe::App for App {
                         self.target = target;
                     }
                     self.backend.visible.store(true, Ordering::Relaxed);
+                    // 呼出剪贴板时始终回到剪贴板页：退出启动器、JSON、时间戳等页面。
                     self.launcher.active = false;
+                    self.timestamp.active = false;
+                    self.json.active = false;
                     if queue {
-                        self.launcher.active = false;
-                        self.timestamp.active = false;
-                        self.json.active = false;
                         self.calculator.leave();
                     }
                     if !self.calculator.active {
@@ -2995,6 +3091,8 @@ impl eframe::App for App {
                     self.dirty = true;
                     self.focus_search = true;
                     self.was_focused = false;
+                    // 呼出剪贴板时预览回到持久偏好；图片选中导致的临时展开不会延续。
+                    self.preview_open = self.preview_default;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -3012,6 +3110,17 @@ impl eframe::App for App {
             resize_border(ctx);
         }
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
+        // 面板激活时生效的 JSON / 时间戳快捷键，在所有页面的按键处理之前消费。
+        if focused
+            && !self.settings_open
+            && self.confirm.is_none()
+            && self.enlarged_image.is_none()
+            && !self.launcher.managing()
+            && self.consume_page_shortcuts(ctx)
+        {
+            ctx.request_repaint();
+            return;
+        }
         if self.launcher.active
             && self.was_focused
             && !focused
@@ -3086,13 +3195,13 @@ impl eframe::App for App {
             && !self.ime_composing
             && consume_local_shortcut(ctx, "Ctrl+P")
         {
-            self.preview_open = !self.preview_open;
+            self.set_preview(!self.preview_open);
         }
         let mut navigation_active = false;
         egui::TopBottomPanel::top("header")
             .frame(
                 egui::Frame::NONE
-                    .fill(palette(self.dark, self.theme).panel)
+                    .fill(Color32::TRANSPARENT)
                     .inner_margin(egui::Margin::symmetric(14, 6)),
             )
             .show(ctx, |ui| {
@@ -3106,7 +3215,7 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
             ui.add_space(6.);
-            let command_mode = self.query.starts_with('>');
+            let command_mode = self.query.starts_with(['>', '＞']);
             let search = ui
                 .horizontal(|ui| {
                     ui.label(
@@ -3132,7 +3241,7 @@ impl eframe::App for App {
                         self.dark = !self.dark;
                         apply_theme(ctx, self.dark, self.theme);
                         if let Ok(dir) = backend::data_dir() {
-                            UiState { dark: self.dark, theme: self.theme }.save(&dir);
+                            UiState::of(self).save(&dir);
                         }
                     }
                     if ghost_icon(ui, &p, "settings", self.settings_open, "偏好设置").clicked() {
@@ -3315,7 +3424,7 @@ impl eframe::App for App {
                     0
                 }
             });
-            if self.query.starts_with('>') {
+            if self.query.starts_with(['>', '＞']) {
                 // 命令模式：↑↓ 在工具列表中移动，Enter 执行。
                 let commands = self.command_items();
                 if delta != 0 && !commands.is_empty() {
@@ -3355,7 +3464,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::NONE
-                    .fill(palette(self.dark, self.theme).panel)
+                    .fill(Color32::TRANSPARENT)
                     .inner_margin(egui::Margin::symmetric(14, 6)),
             )
             .show(ctx, |ui| {
@@ -3434,303 +3543,311 @@ impl eframe::App for App {
         {
             self.enlarge_image(ctx);
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_enabled_ui(!busy && !modal, |ui| {
-                if self.query.starts_with('>') {
-                    self.command_page(ui);
-                    return;
-                }
-                let drawer_w = if self.preview_open { 260. } else { 0. };
-                let list_w = (ui.available_width() - drawer_w).max(120.);
-                // 注意：横向布局里 available_height() 不可靠（cursor 高度为 0），先取好。
-                let panel_h = ui.available_height();
-                ui.horizontal(|ui| {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(list_w, panel_h),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            if self.items.is_empty() {
-                                ui.add_space(80.);
-                                ui.centered_and_justified(|ui| {
-                                    ui.vertical(|ui| {
-                                        ui.centered_and_justified(|ui| {
-                                            ui.label(
-                                                mono(if self.filter == "queue" {
-                                                    "还没有待粘贴的内容"
-                                                } else {
-                                                    "—— 没有匹配的记录 ——"
-                                                })
-                                                .size(13.)
-                                                .color(palette(self.dark, self.theme).text_dim),
-                                            );
-                                        });
-                                        ui.add_space(6.);
-                                        ui.centered_and_justified(|ui| {
-                                            ui.label(
-                                                RichText::new(if self.filter == "queue" {
-                                                    "点击「返回添加」，再点记录左侧 + 加入排列"
-                                                } else {
-                                                    "开启记录后，在其他应用复制内容"
-                                                })
-                                                .size(11.5)
-                                                .color(palette(self.dark, self.theme).text_dim),
-                                            );
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT))
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(!busy && !modal, |ui| {
+                    if self.query.starts_with(['>', '＞']) {
+                        self.command_page(ui);
+                        return;
+                    }
+                    let drawer_w = if self.preview_open { 260. } else { 0. };
+                    let list_w = (ui.available_width() - drawer_w).max(120.);
+                    // 注意：横向布局里 available_height() 不可靠（cursor 高度为 0），先取好。
+                    let panel_h = ui.available_height();
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(list_w, panel_h),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                if self.items.is_empty() {
+                                    ui.add_space(80.);
+                                    ui.centered_and_justified(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.centered_and_justified(|ui| {
+                                                ui.label(
+                                                    mono(if self.filter == "queue" {
+                                                        "还没有待粘贴的内容"
+                                                    } else {
+                                                        "—— 没有匹配的记录 ——"
+                                                    })
+                                                    .size(13.)
+                                                    .color(palette(self.dark, self.theme).text_dim),
+                                                );
+                                            });
+                                            ui.add_space(6.);
+                                            ui.centered_and_justified(|ui| {
+                                                ui.label(
+                                                    RichText::new(if self.filter == "queue" {
+                                                        "点击「返回添加」，再点记录左侧 + 加入排列"
+                                                    } else {
+                                                        "开启记录后，在其他应用复制内容"
+                                                    })
+                                                    .size(11.5)
+                                                    .color(palette(self.dark, self.theme).text_dim),
+                                                );
+                                            });
                                         });
                                     });
-                                });
-                                return;
-                            }
-                            if self.history_up_distance > 140.
-                                && self.history_offset > ROW_STEP * 3.
-                            {
-                                ui.horizontal(|ui| {
-                                    if ui.button("↑ 回到顶部").clicked() {
-                                        self.history_top = true;
-                                        self.history_up_distance = 0.;
-                                        self.scroll_selected = false;
-                                    }
-                                });
-                            }
-                            let mut area = egui::ScrollArea::vertical()
-                                .id_salt("history")
-                                .auto_shrink([false, false]);
-                            if self.scroll_selected {
-                                if let Some(index) =
-                                    self.items.iter().position(|e| e.id == self.selected)
-                                {
-                                    area = area.vertical_scroll_offset(index as f32 * ROW_STEP);
+                                    return;
                                 }
-                                self.scroll_selected = false;
-                            }
-                            if self.history_top {
-                                area = area.vertical_scroll_offset(0.);
-                                self.history_top = false;
-                            }
-                            let items = std::mem::take(&mut self.items);
-                            self.thumb_budget = THUMB_BUDGET;
-                            let history_scroll =
-                                area.show_rows(ui, ROW_HEIGHT, items.len(), |ui, range| {
-                                    let p = palette(self.dark, self.theme);
-                                    for index in range {
-                                        let item = &items[index];
-                                        ui.horizontal(|ui| {
-                                            let in_queue = self.filter == "queue";
-                                            let queued = self
-                                                .backend
-                                                .store
-                                                .lock()
-                                                .unwrap()
-                                                .organizer
-                                                .queue
-                                                .contains(&item.id);
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        mono(if queued { "−" } else { "+" })
-                                                            .color(p.accent),
-                                                    )
-                                                    .fill(if queued {
-                                                        p.accent_soft
-                                                    } else {
-                                                        Color32::TRANSPARENT
-                                                    })
-                                                    .min_size(Vec2::new(24., 24.)),
-                                                )
-                                                .on_hover_text(if queued {
-                                                    "已加入排列，点击移除"
-                                                } else {
-                                                    "加入排列粘贴"
-                                                })
-                                                .clicked()
-                                            {
-                                                let id = item.id.clone();
-                                                self.operation(|s| {
-                                                    let mut q = s.organizer.queue.clone();
-                                                    if q.contains(&id) {
-                                                        q.retain(|v| v != &id);
-                                                    } else {
-                                                        q.push(id);
-                                                    }
-                                                    s.queue(q)
-                                                });
-                                            }
-                                            let width = ui.available_width()
-                                                - if in_queue { 64. } else { 0. };
-                                            let (rect, response) = ui.allocate_exact_size(
-                                                Vec2::new(width, ROW_HEIGHT),
-                                                egui::Sense::click(),
-                                            );
-                                            let selected = item.id == self.selected;
-                                            let hover = ui.ctx().animate_bool_with_time(
-                                                egui::Id::new(("row-hover", &item.id)),
-                                                response.hovered(),
-                                                0.08,
-                                            );
-                                            let fill = if selected {
-                                                p.card_selected
-                                            } else {
-                                                mix(p.card, p.card_hover, hover)
-                                            };
-                                            let border = if selected {
-                                                p.accent
-                                            } else {
-                                                mix(p.hairline, p.accent, hover * 0.6)
-                                            };
-                                            // Paint the card, then draw contents on top in a child UI.
-                                            let corner = CornerRadius::same(5);
-                                            ui.painter()
-                                                .add(egui::Shape::rect_filled(rect, corner, fill));
-                                            if selected {
-                                                ui.painter().add(egui::Shape::rect_filled(
-                                                    egui::Rect::from_min_size(
-                                                        rect.min + egui::vec2(1.5, 1.5),
-                                                        egui::vec2(3., rect.height() - 3.),
-                                                    ),
-                                                    CornerRadius {
-                                                        nw: 2,
-                                                        ne: 0,
-                                                        se: 0,
-                                                        sw: 2,
-                                                    },
-                                                    p.accent,
-                                                ));
-                                            }
-                                            ui.painter().add(egui::Shape::rect_stroke(
-                                                rect,
-                                                corner,
-                                                egui::Stroke::new(1., border),
-                                                egui::StrokeKind::Inside,
-                                            ));
-                                            let mut card = ui.new_child(
-                                                egui::UiBuilder::new()
-                                                    .id_salt(egui::Id::new(&item.id))
-                                                    .max_rect(rect.shrink2(Vec2::new(12., 6.))),
-                                            );
-                                            card.horizontal_top(|ui| {
-                                                if item.kind == "image" {
-                                                    self.row_thumbnail(ui, item);
-                                                }
-                                                ui.vertical(|ui| {
-                                                    ui.add_space(1.);
-                                                    ui.horizontal(|ui| {
-                                                        if item.pinned {
-                                                            ui.label(
-                                                                RichText::new("★").color(p.star),
-                                                            );
-                                                        }
-                                                        let summary = item
-                                                            .preview
-                                                            .split_whitespace()
-                                                            .collect::<Vec<_>>()
-                                                            .join(" ");
-                                                        let mut title: String =
-                                                            summary.chars().take(75).collect();
-                                                        if summary.chars().count() > 75 {
-                                                            title.push('…');
-                                                        }
-                                                        ui.add(
-                                                            egui::Label::new(
-                                                                RichText::new(title)
-                                                                    .strong()
-                                                                    .color(p.text),
-                                                            )
-                                                            .truncate(),
-                                                        );
-                                                    });
-                                                    ui.horizontal(|ui| {
-                                                        let kind = match item.kind.as_str() {
-                                                            "image" => "IMG",
-                                                            "link" => "URL",
-                                                            _ => "TXT",
-                                                        };
-                                                        kind_tag(ui, &p, kind);
-                                                        if !item.source.is_empty() {
-                                                            ui.label(
-                                                                RichText::new(&item.source)
-                                                                    .small()
-                                                                    .color(p.text_dim),
-                                                            );
-                                                        }
-                                                        ui.with_layout(
-                                                            egui::Layout::right_to_left(
-                                                                egui::Align::Center,
-                                                            ),
-                                                            |ui| {
-                                                                ui.label(
-                                                                    mono(time_label(
-                                                                        item.copied_at,
-                                                                    ))
-                                                                    .size(10.5)
-                                                                    .color(p.text_dim),
-                                                                );
-                                                                if selected {
-                                                                    ui.add_space(8.);
-                                                                    ui.label(
-                                                                        mono("⏎ 粘贴")
-                                                                            .size(10.5)
-                                                                            .strong()
-                                                                            .color(p.accent),
-                                                                    );
-                                                                }
-                                                            },
-                                                        );
-                                                    });
-                                                });
-                                            });
-                                            if response.clicked() {
-                                                self.selected = item.id.clone();
-                                            }
-                                            if response.double_clicked() {
-                                                self.selected = item.id.clone();
-                                                self.apply(true, false, false);
-                                            }
-                                            if in_queue {
-                                                for (label, delta) in [("↑", -1isize), ("↓", 1)]
-                                                {
-                                                    if ui
-                                                        .small_button(mono(label).color(p.text_dim))
-                                                        .clicked()
-                                                    {
-                                                        let id = item.id.clone();
-                                                        self.operation(|s| {
-                                                            let mut q = s.organizer.queue.clone();
-                                                            if let Some(i) =
-                                                                q.iter().position(|v| v == &id)
-                                                            {
-                                                                let j = i as isize + delta;
-                                                                if j >= 0 && (j as usize) < q.len()
-                                                                {
-                                                                    q.swap(i, j as usize);
-                                                                }
-                                                            }
-                                                            s.queue(q)
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        });
+                                if self.history_up_distance > 140.
+                                    && self.history_offset > ROW_STEP * 3.
+                                {
+                                    ui.horizontal(|ui| {
+                                        if ui.button("↑ 回到顶部").clicked() {
+                                            self.history_top = true;
+                                            self.history_up_distance = 0.;
+                                            self.scroll_selected = false;
+                                        }
+                                    });
+                                }
+                                let mut area = egui::ScrollArea::vertical()
+                                    .id_salt("history")
+                                    .auto_shrink([false, false]);
+                                if self.scroll_selected {
+                                    if let Some(index) =
+                                        self.items.iter().position(|e| e.id == self.selected)
+                                    {
+                                        area = area.vertical_scroll_offset(index as f32 * ROW_STEP);
                                     }
-                                });
-                            let offset = history_scroll.state.offset.y;
-                            let delta = self.history_offset - offset;
-                            if delta > 0. {
-                                self.history_up_distance += delta;
-                            } else if delta < -1. {
-                                self.history_up_distance = 0.;
-                            }
-                            if offset < 1. {
-                                self.history_up_distance = 0.;
-                            }
-                            self.history_offset = offset;
-                            self.items = items;
-                        },
-                    );
-                    if self.preview_open {
-                        self.preview_drawer(ui, panel_h);
-                    }
+                                    self.scroll_selected = false;
+                                }
+                                if self.history_top {
+                                    area = area.vertical_scroll_offset(0.);
+                                    self.history_top = false;
+                                }
+                                let items = std::mem::take(&mut self.items);
+                                self.thumb_budget = THUMB_BUDGET;
+                                let history_scroll =
+                                    area.show_rows(ui, ROW_HEIGHT, items.len(), |ui, range| {
+                                        let p = palette(self.dark, self.theme);
+                                        for index in range {
+                                            let item = &items[index];
+                                            ui.horizontal(|ui| {
+                                                let in_queue = self.filter == "queue";
+                                                let queued = self
+                                                    .backend
+                                                    .store
+                                                    .lock()
+                                                    .unwrap()
+                                                    .organizer
+                                                    .queue
+                                                    .contains(&item.id);
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            mono(if queued { "−" } else { "+" })
+                                                                .color(p.accent),
+                                                        )
+                                                        .fill(if queued {
+                                                            p.accent_soft
+                                                        } else {
+                                                            Color32::TRANSPARENT
+                                                        })
+                                                        .min_size(Vec2::new(24., 24.)),
+                                                    )
+                                                    .on_hover_text(if queued {
+                                                        "已加入排列，点击移除"
+                                                    } else {
+                                                        "加入排列粘贴"
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    let id = item.id.clone();
+                                                    self.operation(|s| {
+                                                        let mut q = s.organizer.queue.clone();
+                                                        if q.contains(&id) {
+                                                            q.retain(|v| v != &id);
+                                                        } else {
+                                                            q.push(id);
+                                                        }
+                                                        s.queue(q)
+                                                    });
+                                                }
+                                                let width = ui.available_width()
+                                                    - if in_queue { 64. } else { 0. };
+                                                let (rect, response) = ui.allocate_exact_size(
+                                                    Vec2::new(width, ROW_HEIGHT),
+                                                    egui::Sense::click(),
+                                                );
+                                                let selected = item.id == self.selected;
+                                                let hover = ui.ctx().animate_bool_with_time(
+                                                    egui::Id::new(("row-hover", &item.id)),
+                                                    response.hovered(),
+                                                    0.08,
+                                                );
+                                                let fill = if selected {
+                                                    p.card_selected
+                                                } else {
+                                                    mix(p.card, p.card_hover, hover)
+                                                };
+                                                let border = if selected {
+                                                    p.accent
+                                                } else {
+                                                    mix(p.hairline, p.accent, hover * 0.6)
+                                                };
+                                                // Paint the card, then draw contents on top in a child UI.
+                                                let corner = CornerRadius::same(5);
+                                                ui.painter().add(egui::Shape::rect_filled(
+                                                    rect, corner, fill,
+                                                ));
+                                                if selected {
+                                                    ui.painter().add(egui::Shape::rect_filled(
+                                                        egui::Rect::from_min_size(
+                                                            rect.min + egui::vec2(1.5, 1.5),
+                                                            egui::vec2(3., rect.height() - 3.),
+                                                        ),
+                                                        CornerRadius {
+                                                            nw: 2,
+                                                            ne: 0,
+                                                            se: 0,
+                                                            sw: 2,
+                                                        },
+                                                        p.accent,
+                                                    ));
+                                                }
+                                                ui.painter().add(egui::Shape::rect_stroke(
+                                                    rect,
+                                                    corner,
+                                                    egui::Stroke::new(1., border),
+                                                    egui::StrokeKind::Inside,
+                                                ));
+                                                let mut card = ui.new_child(
+                                                    egui::UiBuilder::new()
+                                                        .id_salt(egui::Id::new(&item.id))
+                                                        .max_rect(rect.shrink2(Vec2::new(12., 6.))),
+                                                );
+                                                card.horizontal_top(|ui| {
+                                                    if item.kind == "image" {
+                                                        self.row_thumbnail(ui, item);
+                                                    }
+                                                    ui.vertical(|ui| {
+                                                        ui.add_space(1.);
+                                                        ui.horizontal(|ui| {
+                                                            if item.pinned {
+                                                                ui.label(
+                                                                    RichText::new("★")
+                                                                        .color(p.star),
+                                                                );
+                                                            }
+                                                            let summary = item
+                                                                .preview
+                                                                .split_whitespace()
+                                                                .collect::<Vec<_>>()
+                                                                .join(" ");
+                                                            let mut title: String =
+                                                                summary.chars().take(75).collect();
+                                                            if summary.chars().count() > 75 {
+                                                                title.push('…');
+                                                            }
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    RichText::new(title)
+                                                                        .strong()
+                                                                        .color(p.text),
+                                                                )
+                                                                .truncate(),
+                                                            );
+                                                        });
+                                                        ui.horizontal(|ui| {
+                                                            let kind = match item.kind.as_str() {
+                                                                "image" => "IMG",
+                                                                "link" => "URL",
+                                                                _ => "TXT",
+                                                            };
+                                                            kind_tag(ui, &p, kind);
+                                                            if !item.source.is_empty() {
+                                                                ui.label(
+                                                                    RichText::new(&item.source)
+                                                                        .small()
+                                                                        .color(p.text_dim),
+                                                                );
+                                                            }
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(
+                                                                    egui::Align::Center,
+                                                                ),
+                                                                |ui| {
+                                                                    ui.label(
+                                                                        mono(time_label(
+                                                                            item.copied_at,
+                                                                        ))
+                                                                        .size(10.5)
+                                                                        .color(p.text_dim),
+                                                                    );
+                                                                    if selected {
+                                                                        ui.add_space(8.);
+                                                                        ui.label(
+                                                                            mono("⏎ 粘贴")
+                                                                                .size(10.5)
+                                                                                .strong()
+                                                                                .color(p.accent),
+                                                                        );
+                                                                    }
+                                                                },
+                                                            );
+                                                        });
+                                                    });
+                                                });
+                                                if response.clicked() {
+                                                    self.selected = item.id.clone();
+                                                }
+                                                if response.double_clicked() {
+                                                    self.selected = item.id.clone();
+                                                    self.apply(true, false, false);
+                                                }
+                                                if in_queue {
+                                                    for (label, delta) in [("↑", -1isize), ("↓", 1)]
+                                                    {
+                                                        if ui
+                                                            .small_button(
+                                                                mono(label).color(p.text_dim),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            let id = item.id.clone();
+                                                            self.operation(|s| {
+                                                                let mut q =
+                                                                    s.organizer.queue.clone();
+                                                                if let Some(i) =
+                                                                    q.iter().position(|v| v == &id)
+                                                                {
+                                                                    let j = i as isize + delta;
+                                                                    if j >= 0
+                                                                        && (j as usize) < q.len()
+                                                                    {
+                                                                        q.swap(i, j as usize);
+                                                                    }
+                                                                }
+                                                                s.queue(q)
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    });
+                                let offset = history_scroll.state.offset.y;
+                                let delta = self.history_offset - offset;
+                                if delta > 0. {
+                                    self.history_up_distance += delta;
+                                } else if delta < -1. {
+                                    self.history_up_distance = 0.;
+                                }
+                                if offset < 1. {
+                                    self.history_up_distance = 0.;
+                                }
+                                self.history_offset = offset;
+                                self.items = items;
+                            },
+                        );
+                        if self.preview_open {
+                            self.preview_drawer(ui, panel_h);
+                        }
+                    });
                 });
             });
-        });
         if self.settings_open {
             self.capture_hotkey(ctx);
         } else {
@@ -3810,7 +3927,8 @@ impl App {
                     egui::Frame::window(&ctx.style())
                         .fill(palette(self.dark, self.theme).panel)
                         .stroke(egui::Stroke::new(1., palette(self.dark, self.theme).border))
-                        .corner_radius(CornerRadius::same(14))
+                        .corner_radius(CornerRadius::same(APP_CORNER_RADIUS))
+                        .shadow(egui::Shadow::NONE)
                         .inner_margin(egui::Margin::same(0)),
                 )
                 .resizable(false)
@@ -3825,10 +3943,10 @@ impl App {
                         ui.painter().rect_filled(
                             nav_rect,
                             CornerRadius {
-                                nw: 14,
+                                nw: APP_CORNER_RADIUS,
                                 ne: 0,
                                 se: 0,
-                                sw: 14,
+                                sw: APP_CORNER_RADIUS,
                             },
                             p.card,
                         );
@@ -3972,33 +4090,58 @@ impl App {
                                         })
                                         .show(ui, |ui| {
                                             ui.set_width(ui.available_width());
-                                            ui.label(
-                                                RichText::new(self.settings_section.label())
-                                                    .size(16.)
-                                                    .strong()
-                                                    .color(p.text),
-                                            );
-                                            ui.label(
-                                                RichText::new(match self.settings_section {
-                                                    SettingsSection::General => {
-                                                        "启动、外观与记录开关"
-                                                    }
-                                                    SettingsSection::Clipboard => {
-                                                        "采集策略与历史保留"
-                                                    }
-                                                    SettingsSection::Launcher => {
-                                                        "搜索范围与指令前缀"
-                                                    }
-                                                    SettingsSection::Hotkeys => {
-                                                        "点击「重录」后按下新组合键；需包含 Ctrl 或 Alt，Windows 不支持 Win 键"
-                                                    }
-                                                    SettingsSection::Data => {
-                                                        "本地加密存储，备份保存在数据目录"
-                                                    }
-                                                })
-                                                .size(11.5)
-                                                .color(p.text_dim),
-                                            );
+                                            ui.horizontal(|ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.set_width(
+                                                        (ui.available_width() - 40.).max(200.),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(
+                                                            self.settings_section.label(),
+                                                        )
+                                                        .size(16.)
+                                                        .strong()
+                                                        .color(p.text),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(match self.settings_section {
+                                                            SettingsSection::General => {
+                                                                "启动、外观与记录开关"
+                                                            }
+                                                            SettingsSection::Clipboard => {
+                                                                "采集策略与历史保留"
+                                                            }
+                                                            SettingsSection::Launcher => {
+                                                                "搜索范围与指令前缀"
+                                                            }
+                                                            SettingsSection::Hotkeys => {
+                                                                "点击「重录」后按下新组合键；需包含 Ctrl 或 Alt，Windows 不支持 Win 键"
+                                                            }
+                                                            SettingsSection::Data => {
+                                                                "本地加密存储，备份保存在数据目录"
+                                                            }
+                                                        })
+                                                        .size(11.5)
+                                                        .color(p.text_dim),
+                                                    );
+                                                });
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        if icon_button(
+                                                            ui,
+                                                            &p,
+                                                            "close",
+                                                            false,
+                                                            "关闭设置",
+                                                        )
+                                                        .clicked()
+                                                        {
+                                                            open = false;
+                                                        }
+                                                    },
+                                                );
+                                            });
                                             ui.add_space(16.);
                                             match self.settings_section {
                             SettingsSection::General => {
@@ -4035,7 +4178,7 @@ impl App {
                                                 self.theme = theme;
                                                 apply_theme(ui.ctx(), self.dark, self.theme);
                                                 if let Ok(dir) = backend::data_dir() {
-                                                    UiState { dark: self.dark, theme: self.theme }.save(&dir);
+                                                    UiState::of(self).save(&dir);
                                                 }
                                             }
                                             ui.add_space(6.);
@@ -4049,7 +4192,7 @@ impl App {
                                             self.dark = false;
                                             apply_theme(ui.ctx(), self.dark, self.theme);
                                             if let Ok(dir) = backend::data_dir() {
-                                                UiState { dark: self.dark, theme: self.theme }.save(&dir);
+                                                UiState::of(self).save(&dir);
                                             }
                                         }
                                         ui.add_space(6.);
@@ -4059,10 +4202,23 @@ impl App {
                                             self.dark = true;
                                             apply_theme(ui.ctx(), self.dark, self.theme);
                                             if let Ok(dir) = backend::data_dir() {
-                                                UiState { dark: self.dark, theme: self.theme }.save(&dir);
+                                                UiState::of(self).save(&dir);
                                             }
                                         }
                                     });
+                                    card_divider(ui, &p);
+                                    setting_row(
+                                        ui,
+                                        &p,
+                                        "预览面板",
+                                        "关闭后不再默认展开预览抽屉，仍可用 Ctrl+P 切换",
+                                        |ui| {
+                                            let mut value = self.preview_open;
+                                            if toggle(ui, &p, &mut value, "") {
+                                                self.set_preview(value);
+                                            }
+                                        },
+                                    );
                                 });
                                 settings_card(ui, &p, "记录", |ui| {
                                     setting_row(
@@ -4431,11 +4587,23 @@ impl App {
                                     ),
                                     (
                                         "面板内",
-                                        vec![(
-                                            HotkeySlot::Find,
-                                            "查找",
-                                            self.settings.find_hotkey.clone(),
-                                        )],
+                                        vec![
+                                            (
+                                                HotkeySlot::Find,
+                                                "查找",
+                                                self.settings.find_hotkey.clone(),
+                                            ),
+                                            (
+                                                HotkeySlot::Json,
+                                                "JSON 工作页",
+                                                self.settings.json_hotkey.clone(),
+                                            ),
+                                            (
+                                                HotkeySlot::Timestamp,
+                                                "时间戳转换",
+                                                self.settings.timestamp_hotkey.clone(),
+                                            ),
+                                        ],
                                     ),
                                 ] {
                                     settings_card(ui, &p, card, |ui| {
@@ -4446,7 +4614,7 @@ impl App {
                                                 card_divider(ui, &p);
                                             }
                                             let active = self.hotkey_capture == Some(*slot);
-                                            setting_row(ui, &p, label, "", |ui| {
+                                            setting_row_sized(ui, &p, label, "", 280., |ui| {
                                                 let text = if active {
                                                     pending_hotkey_label(ui.ctx())
                                                 } else if value.is_empty() {
@@ -4462,7 +4630,7 @@ impl App {
                                                             p.text
                                                         }),
                                                     )
-                                                    .min_size(Vec2::new(120., 24.))
+                                                    .min_size(Vec2::new(150., 24.))
                                                     .fill(if active {
                                                         p.accent_soft
                                                     } else {
@@ -4479,6 +4647,7 @@ impl App {
                                                         if active { None } else { Some(*slot) };
                                                     self.capture_error.clear();
                                                 }
+                                                ui.add_space(14.);
                                                 if ghost(ui, "重录").clicked() {
                                                     self.hotkey_capture = Some(*slot);
                                                     self.capture_error.clear();
@@ -4578,10 +4747,6 @@ impl App {
                                                 |ui| {
                                                     if primary(ui, &p, "保存设置").clicked() {
                                                         self.save_settings();
-                                                    }
-                                                    ui.add_space(10.);
-                                                    if ghost(ui, "关闭").clicked() {
-                                                        open = false;
                                                     }
                                                 },
                                             );

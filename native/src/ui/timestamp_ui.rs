@@ -229,7 +229,11 @@ impl App {
             ));
         }
         egui::TopBottomPanel::top("timestamp-header")
-            .frame(egui::Frame::NONE.fill(p.panel).inner_margin(10))
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(10),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("←").clicked() {
@@ -252,7 +256,11 @@ impl App {
                 ui.label(RichText::new("秒与毫秒，日期与时间，一次转换清楚").color(p.text_dim));
             });
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(p.panel).inner_margin(10))
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(10),
+            )
             .show(ctx, |ui| {
                 ui.spacing_mut().button_padding = Vec2::new(12., 8.);
                 ui.spacing_mut().interact_size.y = 36.;

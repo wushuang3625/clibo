@@ -775,7 +775,11 @@ mod tests {
         assert_eq!(result.rows[0].custom, Some(0));
         assert!(search(&catalog, &[], &[], "bm editor").rows.is_empty());
         let result = search(&catalog, &[], &[], "sys shutdown");
+        // 关机/重启等系统操作仅在 Windows 提供；其他平台 sys 查询不应返回它们。
+        #[cfg(windows)]
         assert_eq!(result.rows[0].action, Action::Builtin(Builtin::Shutdown));
+        #[cfg(not(windows))]
+        assert!(result.rows.is_empty());
         assert!(Builtin::Shutdown.requires_confirmation());
     }
     #[test]

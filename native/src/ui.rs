@@ -36,7 +36,13 @@ mod json_parser;
 mod json_ui;
 mod json_view;
 mod launcher_ui;
+mod theme;
 mod timestamp_ui;
+mod widgets;
+
+// 主题系统与自绘小组件在此统一再导出，面板与各子页面沿用 `super::*` 即可访问。
+pub(crate) use theme::*;
+pub(crate) use widgets::*;
 
 const ROW_HEIGHT: f32 = 64.;
 const ROW_STEP: f32 = ROW_HEIGHT + 8.;
@@ -157,6 +163,8 @@ enum HotkeySlot {
     Queue,
     Find,
     Launcher,
+    Json,
+    Timestamp,
 }
 /// `>` 命令模式里的一个工具条目。
 struct CommandItem {
@@ -165,59 +173,6 @@ struct CommandItem {
     name: &'static str,
     desc: &'static str,
     meta: String,
-}
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SettingsSection {
-    General,
-    Clipboard,
-    Launcher,
-    Hotkeys,
-    Data,
-}
-impl SettingsSection {
-    const ALL: [SettingsSection; 5] = [
-        SettingsSection::General,
-        SettingsSection::Clipboard,
-        SettingsSection::Launcher,
-        SettingsSection::Hotkeys,
-        SettingsSection::Data,
-    ];
-    fn label(self) -> &'static str {
-        match self {
-            SettingsSection::General => "通用",
-            SettingsSection::Clipboard => "剪贴板",
-            SettingsSection::Launcher => "启动器",
-            SettingsSection::Hotkeys => "快捷键",
-            SettingsSection::Data => "数据与备份",
-        }
-    }
-    /// Keywords matched by the in-settings search box.
-    fn keywords(self) -> &'static str {
-        match self {
-            SettingsSection::General => {
-                "通用 开机自启 外观 主题 浅色 深色 蓝灰 琥珀 记录剪贴板 暂停"
-            }
-            SettingsSection::Clipboard => {
-                "剪贴板 采集 记录图片 跳过疑似密钥 历史上限 保留天数 JSON 历史 排除应用 分组"
-            }
-            SettingsSection::Launcher => {
-                "启动器 搜索范围 书签 搜索目录 搜索指令 前缀 应用 文件 网页 计算"
-            }
-            SettingsSection::Hotkeys => "快捷键 呼出面板 排列粘贴 队列 启动器 查找 重录",
-            SettingsSection::Data => "数据 备份 恢复 清理",
-        }
-    }
-    fn matches(self, query: &str) -> bool {
-        let query = query.trim().to_lowercase();
-        if query.is_empty() {
-            return true;
-        }
-        self.label().contains(&query)
-            || self
-                .keywords()
-                .split_whitespace()
-                .any(|word| word.to_lowercase().contains(&query))
-    }
 }
 pub struct App {
     backend: Arc<Backend>,
@@ -270,6 +225,8 @@ pub struct App {
     transform: String,
     confirm: Option<String>,
     preview_open: bool,
+    /// 预览抽屉的持久偏好（设置开关与 Ctrl+P 共用）；选中图片时不再强行覆盖它。
+    preview_default: bool,
     ime_composing: bool,
     smoke: Option<std::time::Instant>,
     screenshot_requested: bool,
@@ -288,11 +245,7 @@ pub struct App {
 
 fn hotkey_specs(settings: &Settings) -> Result<Vec<(&'static str, HotKey)>, String> {
     let mut keys = Vec::new();
-    for (name, raw) in [
-        ("呼出面板", &settings.hotkey),
-        ("排列粘贴", &settings.queue_hotkey),
-        ("启动器", &settings.launcher_hotkey),
-    ] {
+    for (name, raw) in settings.hotkeys.global() {
         let key = HotKey::from_str(raw).map_err(|e| format!("{name}快捷键格式错误：{e}"))?;
         if keys.iter().any(|(_, old)| *old == key) {
             return Err("全局快捷键不能重复".into());
@@ -320,11 +273,7 @@ fn register(manager: &GlobalHotKeyManager, settings: &Settings) -> Result<Vec<Ho
 fn register_available(manager: &GlobalHotKeyManager, settings: &Settings) -> (Vec<HotKey>, String) {
     let mut registered = Vec::new();
     let mut errors = Vec::new();
-    for (name, raw) in [
-        ("呼出面板", &settings.hotkey),
-        ("排列粘贴", &settings.queue_hotkey),
-        ("启动器", &settings.launcher_hotkey),
-    ] {
+    for (name, raw) in settings.hotkeys.global() {
         match HotKey::from_str(raw) {
             Ok(key) => match manager.register(key) {
                 Ok(()) => registered.push(key),
@@ -349,8 +298,8 @@ pub fn run() -> Result<(), String> {
             return Err("演示模式要求 CLIBO_DATA_DIR 指向空的独立测试目录".into());
         }
         let mut settings = store.settings.clone();
-        settings.hotkey = "Ctrl+Alt+F11".into();
-        settings.queue_hotkey = "Ctrl+Alt+F12".into();
+        settings.hotkeys.summon = "Ctrl+Alt+F11".into();
+        settings.hotkeys.queue = "Ctrl+Alt+F12".into();
         settings.enabled = false;
         store.save_settings(settings)?;
         store.group("", "TOOL", false)?;
@@ -381,16 +330,17 @@ pub fn run() -> Result<(), String> {
             })
             .with_title("Clibo · Native")
             .with_decorations(false)
+            .with_transparent(true)
             .with_inner_size(
                 if std::env::args().any(|a| a == "--smoke")
                     && std::env::args().any(|a| a == "--small")
                 {
-                    [620., 440.]
+                    [560., 440.]
                 } else {
-                    [780., 580.]
+                    [660., 580.]
                 },
             )
-            .with_min_inner_size([620., 440.])
+            .with_min_inner_size([560., 440.])
             .with_always_on_top(),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
@@ -446,7 +396,7 @@ pub fn run() -> Result<(), String> {
             GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
                 if event.state == HotKeyState::Pressed {
                     let settings = event_backend.store.lock().unwrap().settings.clone();
-                    if HotKey::from_str(&settings.launcher_hotkey)
+                    if HotKey::from_str(&settings.hotkeys.launcher)
                         .is_ok_and(|key| key.id() == event.id)
                     {
                         let foreground = platform::foreground();
@@ -461,7 +411,7 @@ pub fn run() -> Result<(), String> {
                         );
                         return;
                     }
-                    let queue = HotKey::from_str(&settings.queue_hotkey)
+                    let queue = HotKey::from_str(&settings.hotkeys.queue)
                         .is_ok_and(|key| key.id() == event.id);
                     dispatch(
                         &hot_tx,
@@ -609,7 +559,8 @@ pub fn run() -> Result<(), String> {
                 image_actual_size: false,
                 transform: "original".into(),
                 confirm: None,
-                preview_open: true,
+                preview_open: ui_state.preview_open,
+                preview_default: ui_state.preview_open,
                 ime_composing: false,
                 smoke: std::env::args()
                     .any(|a| a == "--smoke")
@@ -632,121 +583,27 @@ pub fn run() -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-#[derive(Clone, Copy)]
-struct Palette {
-    panel: Color32,
-    card: Color32,
-    card_hover: Color32,
-    card_selected: Color32,
-    border: Color32,
-    hairline: Color32,
-    text: Color32,
-    text_dim: Color32,
-    accent: Color32,
-    accent_soft: Color32,
-    on_accent: Color32,
-    star: Color32,
-    error: Color32,
-    input: Color32,
-}
-/// 双主题：琥珀 = "精密仪器"（暖黑曜石 + 琥珀信号色，浅色为暖纸面 + 墨色）；
-/// 蓝灰 = 启动器原配色（深空蓝黑 + 长春花蓝信号色，浅色为冷纸面）。
-fn palette(dark: bool, theme: Theme) -> Palette {
-    if theme == Theme::Blue {
-        if dark {
-            return Palette {
-                panel: Color32::from_rgb(0x1B, 0x1D, 0x23),
-                card: Color32::from_rgb(0x22, 0x25, 0x2D),
-                card_hover: Color32::from_rgb(0x2A, 0x2E, 0x39),
-                card_selected: Color32::from_rgb(0x2F, 0x35, 0x50),
-                border: Color32::from_rgb(0x3A, 0x3F, 0x4C),
-                hairline: Color32::from_rgb(0x2C, 0x2F, 0x3A),
-                text: Color32::from_rgb(0xE7, 0xEA, 0xF2),
-                text_dim: Color32::from_rgb(0x8F, 0x96, 0xA6),
-                accent: Color32::from_rgb(0x9E, 0xAA, 0xFF),
-                accent_soft: Color32::from_rgb(0x2A, 0x2F, 0x4E),
-                on_accent: Color32::from_rgb(0x17, 0x1A, 0x2E),
-                star: Color32::from_rgb(0xB8, 0xC3, 0xFF),
-                error: Color32::from_rgb(0xE0, 0x64, 0x5A),
-                input: Color32::from_rgb(0x17, 0x19, 0x1F),
-            };
-        }
-        return Palette {
-            panel: Color32::from_rgb(0xED, 0xF0, 0xF5),
-            card: Color32::from_rgb(0xF8, 0xFA, 0xFD),
-            card_hover: Color32::from_rgb(0xE4, 0xE9, 0xF2),
-            card_selected: Color32::from_rgb(0xDB, 0xE3, 0xFA),
-            border: Color32::from_rgb(0xD1, 0xD7, 0xE2),
-            hairline: Color32::from_rgb(0xDE, 0xE3, 0xEC),
-            text: Color32::from_rgb(0x1B, 0x1E, 0x27),
-            text_dim: Color32::from_rgb(0x6B, 0x72, 0x80),
-            accent: Color32::from_rgb(0x4C, 0x5F, 0xD7),
-            accent_soft: Color32::from_rgb(0xE5, 0xE9, 0xFB),
-            on_accent: Color32::WHITE,
-            star: Color32::from_rgb(0x6B, 0x7B, 0xE8),
-            error: Color32::from_rgb(0xB3, 0x26, 0x1E),
-            input: Color32::from_rgb(0xFB, 0xFC, 0xFE),
-        };
-    }
-    if dark {
-        Palette {
-            panel: Color32::from_rgb(0x12, 0x11, 0x10),
-            card: Color32::from_rgb(0x1B, 0x19, 0x17),
-            card_hover: Color32::from_rgb(0x25, 0x22, 0x1F),
-            card_selected: Color32::from_rgb(0x2E, 0x25, 0x17),
-            border: Color32::from_rgb(0x35, 0x30, 0x2A),
-            hairline: Color32::from_rgb(0x27, 0x24, 0x21),
-            text: Color32::from_rgb(0xEA, 0xE5, 0xDA),
-            text_dim: Color32::from_rgb(0x90, 0x89, 0x7C),
-            accent: Color32::from_rgb(0xED, 0xA3, 0x3A),
-            accent_soft: Color32::from_rgb(0x2B, 0x23, 0x15),
-            on_accent: Color32::from_rgb(0x22, 0x18, 0x06),
-            star: Color32::from_rgb(0xF0, 0xB9, 0x5A),
-            error: Color32::from_rgb(0xE0, 0x64, 0x5A),
-            input: Color32::from_rgb(0x0E, 0x0D, 0x0C),
-        }
-    } else {
-        Palette {
-            panel: Color32::from_rgb(0xF1, 0xED, 0xE4),
-            card: Color32::from_rgb(0xFB, 0xF9, 0xF3),
-            card_hover: Color32::from_rgb(0xEF, 0xE9, 0xDC),
-            card_selected: Color32::from_rgb(0xF5, 0xE4, 0xC3),
-            border: Color32::from_rgb(0xDC, 0xD4, 0xC3),
-            hairline: Color32::from_rgb(0xE4, 0xDE, 0xD0),
-            text: Color32::from_rgb(0x21, 0x1D, 0x16),
-            text_dim: Color32::from_rgb(0x7E, 0x76, 0x67),
-            accent: Color32::from_rgb(0xA9, 0x6D, 0x00),
-            accent_soft: Color32::from_rgb(0xF3, 0xE7, 0xCB),
-            on_accent: Color32::WHITE,
-            star: Color32::from_rgb(0xC7, 0x8F, 0x12),
-            error: Color32::from_rgb(0xB3, 0x26, 0x1E),
-            input: Color32::from_rgb(0xFD, 0xFB, 0xF6),
-        }
-    }
-}
-/// UI-only preference; deliberately separate from the shared encrypted Settings.
-#[derive(Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum Theme {
-    #[default]
-    Amber,
-    Blue,
-}
-impl Theme {
-    fn label(self) -> &'static str {
-        match self {
-            Theme::Amber => "琥珀",
-            Theme::Blue => "蓝灰",
-        }
-    }
-}
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct UiState {
     #[serde(default)]
     dark: bool,
     #[serde(default)]
     theme: Theme,
+    // 历史默认值是打开；serde(default) 给 false，需要 default_preview_open 兜底。
+    #[serde(default = "default_preview_open")]
+    preview_open: bool,
+}
+fn default_preview_open() -> bool {
+    true
 }
 impl UiState {
+    fn of(app: &App) -> Self {
+        Self {
+            dark: app.dark,
+            theme: app.theme,
+            preview_open: app.preview_default,
+        }
+    }
     fn load(dir: &Path) -> Self {
         std::fs::read(dir.join("ui-state.json"))
             .ok()
@@ -758,667 +615,6 @@ impl UiState {
             let _ = std::fs::write(dir.join("ui-state.json"), bytes);
         }
     }
-}
-fn apply_theme(ctx: &egui::Context, dark: bool, theme: Theme) {
-    let p = palette(dark, theme);
-    ctx.set_theme(if dark {
-        egui::ThemePreference::Dark
-    } else {
-        egui::ThemePreference::Light
-    });
-    let mut visuals = if dark {
-        egui::Visuals::dark()
-    } else {
-        egui::Visuals::light()
-    };
-    visuals.panel_fill = p.panel;
-    visuals.window_fill = p.card;
-    visuals.extreme_bg_color = p.input;
-    visuals.faint_bg_color = p.card_hover;
-    visuals.override_text_color = Some(p.text);
-    visuals.hyperlink_color = p.accent;
-    visuals.selection.bg_fill = p.accent_soft;
-    visuals.selection.stroke = egui::Stroke::new(1., p.accent);
-    let round = CornerRadius::same(4);
-    for widget in [
-        &mut visuals.widgets.inactive,
-        &mut visuals.widgets.hovered,
-        &mut visuals.widgets.active,
-        &mut visuals.widgets.open,
-    ] {
-        widget.corner_radius = round;
-        widget.fg_stroke.color = p.text;
-        widget.bg_stroke.width = 1.;
-    }
-    visuals.widgets.inactive.bg_fill = p.card;
-    visuals.widgets.inactive.bg_stroke.color = p.border;
-    visuals.widgets.hovered.bg_fill = p.card_hover;
-    visuals.widgets.hovered.bg_stroke.color = p.accent;
-    visuals.widgets.hovered.fg_stroke.color = p.accent;
-    visuals.widgets.active.bg_fill = p.card_selected;
-    visuals.widgets.active.bg_stroke.color = p.accent;
-    visuals.widgets.open.bg_fill = p.card_hover;
-    visuals.widgets.open.bg_stroke.color = p.border;
-    visuals.widgets.inactive.weak_bg_fill = p.card;
-    visuals.widgets.hovered.weak_bg_fill = p.card_hover;
-    visuals.widgets.active.weak_bg_fill = p.card_selected;
-    visuals.widgets.open.weak_bg_fill = p.card_hover;
-    visuals.widgets.noninteractive.bg_fill = p.panel;
-    visuals.widgets.noninteractive.bg_stroke.color = p.hairline;
-    visuals.widgets.noninteractive.fg_stroke.color = p.text_dim;
-    visuals.window_corner_radius = CornerRadius::same(8);
-    visuals.menu_corner_radius = CornerRadius::same(6);
-    let shadow_alpha = if dark { 90 } else { 40 };
-    let shadow = egui::Shadow {
-        offset: [0, 3],
-        blur: 14,
-        spread: 0,
-        color: Color32::from_black_alpha(shadow_alpha),
-    };
-    visuals.window_shadow = shadow;
-    visuals.popup_shadow = shadow;
-    let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = Vec2::new(9., 7.);
-    style.spacing.button_padding = Vec2::new(10., 5.);
-    style.spacing.menu_margin = egui::Margin::same(6);
-    style.text_styles = [
-        (
-            egui::TextStyle::Heading,
-            egui::FontId::new(17., egui::FontFamily::Proportional),
-        ),
-        (
-            egui::TextStyle::Body,
-            egui::FontId::new(13., egui::FontFamily::Proportional),
-        ),
-        (
-            egui::TextStyle::Button,
-            egui::FontId::new(12.5, egui::FontFamily::Proportional),
-        ),
-        (
-            egui::TextStyle::Small,
-            egui::FontId::new(11., egui::FontFamily::Proportional),
-        ),
-        (
-            egui::TextStyle::Monospace,
-            egui::FontId::new(12., egui::FontFamily::Monospace),
-        ),
-    ]
-    .into();
-    style.visuals = visuals;
-    ctx.set_style(style);
-}
-fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    #[cfg(windows)]
-    let paths = ["C:/Windows/Fonts/simhei.ttf", "C:/Windows/Fonts/msyh.ttc"];
-    #[cfg(target_os = "macos")]
-    let paths = [
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/STHeiti Light.ttc",
-    ];
-    #[cfg(windows)]
-    let mono_paths = [
-        "C:/Windows/Fonts/CascadiaMono.ttf",
-        "C:/Windows/Fonts/consola.ttf",
-    ];
-    #[cfg(target_os = "macos")]
-    let mono_paths = [
-        "/System/Library/Fonts/Menlo.ttc",
-        "/System/Library/Fonts/Monaco.ttf",
-    ];
-    // egui clones owned font bytes into FontVec. A process-lifetime borrowed
-    // buffer lets its FontRef share the same bytes, including across DPI changes.
-    static CJK: std::sync::OnceLock<Option<Box<[u8]>>> = std::sync::OnceLock::new();
-    static MONO: std::sync::OnceLock<Option<Box<[u8]>>> = std::sync::OnceLock::new();
-    // Latin metadata renders in a real monospace face; CJK stays as fallback.
-    if let Some(data) = MONO.get_or_init(|| {
-        mono_paths
-            .iter()
-            .find_map(|path| std::fs::read(path).ok().map(Vec::into_boxed_slice))
-    }) {
-        fonts
-            .font_data
-            .insert("mono-ui".into(), egui::FontData::from_static(data).into());
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .insert(0, "mono-ui".into());
-    }
-    if let Some(data) = CJK.get_or_init(|| {
-        paths
-            .iter()
-            .find_map(|path| std::fs::read(path).ok().map(Vec::into_boxed_slice))
-    }) {
-        fonts
-            .font_data
-            .insert("cjk".into(), egui::FontData::from_static(data).into());
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().push("cjk".into());
-        }
-    }
-    ctx.set_fonts(fonts);
-}
-/// Monospace helper for metadata, counters and keyboard hints.
-fn mono(text: impl Into<String>) -> RichText {
-    RichText::new(text).family(egui::FontFamily::Monospace)
-}
-fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
-    let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
-    Color32::from_rgba_unmultiplied(
-        lerp(a.r(), b.r()),
-        lerp(a.g(), b.g()),
-        lerp(a.b(), b.b()),
-        lerp(a.a(), b.a()),
-    )
-}
-/// Small caps section label with a trailing hairline rule.
-fn section(ui: &mut egui::Ui, p: &Palette, label: &str) {
-    ui.horizontal(|ui| {
-        ui.label(mono(label).size(10.5).color(p.text_dim));
-        let rect = ui.available_rect_before_wrap();
-        ui.painter().hline(
-            egui::Rangef::new(rect.left() + 4., rect.right()),
-            rect.center().y,
-            egui::Stroke::new(1., p.hairline),
-        );
-    });
-}
-/// Pill toggle used for filter chips; active state carries the accent.
-fn pill(ui: &mut egui::Ui, p: &Palette, label: &str, active: bool) -> egui::Response {
-    // Exact geometry avoids font metrics and nested layouts changing chip height.
-    let galley = ui.painter().layout_no_wrap(
-        label.into(),
-        egui::FontId::monospace(11.),
-        if active { p.accent } else { p.text_dim },
-    );
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(galley.size().x + 20., 24.), egui::Sense::click());
-    let hover = response.hovered();
-    ui.painter().rect(
-        rect,
-        CornerRadius::same(12),
-        if active {
-            p.accent_soft
-        } else if hover {
-            p.card_hover
-        } else {
-            Color32::TRANSPARENT
-        },
-        egui::Stroke::new(1., if active || hover { p.accent } else { p.border }),
-        egui::StrokeKind::Inside,
-    );
-    ui.painter()
-        .galley(rect.center() - galley.size() / 2., galley, p.text_dim);
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::WidgetType::SelectableLabel,
-            ui.is_enabled(),
-            active,
-            label,
-        )
-    });
-    response
-}
-/// Frameless text button; hover feedback comes from the accent fg stroke.
-fn ghost(ui: &mut egui::Ui, label: impl Into<String>) -> egui::Response {
-    ui.add(egui::Button::new(RichText::new(label).size(12.)).frame(false))
-}
-/// Font-independent line icons with the same geometry and feedback as filter pills.
-fn icon_button(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    icon: &str,
-    active: bool,
-    hint: &str,
-) -> egui::Response {
-    let response = ui.add(
-        egui::Button::new("")
-            .min_size(Vec2::splat(26.))
-            .corner_radius(CornerRadius::same(13))
-            .fill(if active {
-                p.accent_soft
-            } else {
-                Color32::TRANSPARENT
-            })
-            .stroke(egui::Stroke::new(
-                1.,
-                if active { p.accent } else { p.border },
-            )),
-    );
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), hint));
-    let c = response.rect.center();
-    let painter = ui.painter();
-    let stroke = egui::Stroke::new(
-        1.4,
-        if active || response.hovered() {
-            p.accent
-        } else {
-            p.text_dim
-        },
-    );
-    let line = |a: [f32; 2], b: [f32; 2]| {
-        painter.line_segment([c + Vec2::from(a), c + Vec2::from(b)], stroke);
-    };
-    match icon {
-        "pin" => {
-            line([-3., -6.], [3., -6.]);
-            line([-2., -6.], [-2., -1.]);
-            line([2., -6.], [2., -1.]);
-            line([-2., -1.], [-5., 2.]);
-            line([2., -1.], [5., 2.]);
-            line([-5., 2.], [5., 2.]);
-            line([0., 2.], [0., 7.]);
-        }
-        "sun" | "settings" => {
-            painter.circle_stroke(c, if icon == "sun" { 3. } else { 4.5 }, stroke);
-            if icon == "settings" {
-                painter.circle_stroke(c, 1.5, stroke);
-            }
-            for i in 0..8 {
-                let v = Vec2::angled(i as f32 * std::f32::consts::TAU / 8.);
-                painter.line_segment([c + v * 5.5, c + v * 7.], stroke);
-            }
-        }
-        "moon" => {
-            painter.add(egui::Shape::line(
-                vec![
-                    c + Vec2::new(2., -6.),
-                    c + Vec2::new(-2., -5.),
-                    c + Vec2::new(-5., -1.),
-                    c + Vec2::new(-4., 4.),
-                    c + Vec2::new(0., 6.),
-                    c + Vec2::new(5., 4.),
-                    c + Vec2::new(1., 3.),
-                    c + Vec2::new(-1., 0.),
-                    c + Vec2::new(0., -4.),
-                    c + Vec2::new(2., -6.),
-                ],
-                stroke,
-            ));
-        }
-        "close" => {
-            line([-4., -4.], [4., 4.]);
-            line([4., -4.], [-4., 4.]);
-        }
-        _ => {
-            line([-5., -2.], [0., 3.]);
-            line([0., 3.], [5., -2.]);
-            line([-5., 6.], [5., 6.]);
-        }
-    }
-    response.on_hover_text(hint)
-}
-/// Accent-filled primary action.
-fn primary(ui: &mut egui::Ui, p: &Palette, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(RichText::new(label).size(12.).strong().color(p.on_accent))
-            .fill(p.accent)
-            .stroke(egui::Stroke::NONE)
-            .corner_radius(CornerRadius::same(11))
-            .min_size(Vec2::new(0., 22.)),
-    )
-}
-/// Danger action using the same pill geometry as the rest of the UI.
-fn danger_pill(ui: &mut egui::Ui, p: &Palette, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(mono(label).size(11.).color(p.error))
-            .fill(Color32::TRANSPARENT)
-            .stroke(egui::Stroke::new(1., p.error))
-            .corner_radius(CornerRadius::same(11))
-            .min_size(Vec2::new(0., 22.)),
-    )
-}
-/// Outlined mono tag for the entry kind.
-fn kind_tag(ui: &mut egui::Ui, p: &Palette, label: &str) {
-    egui::Frame::default()
-        .stroke(egui::Stroke::new(1., p.border))
-        .corner_radius(CornerRadius::same(3))
-        .inner_margin(egui::Margin::symmetric(4, 0))
-        .show(ui, |ui| {
-            ui.label(mono(label).size(10.).color(p.accent));
-        });
-}
-/// Borderless icon button for the search row; only hover reveals the chip.
-fn ghost_icon(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    icon: &str,
-    active: bool,
-    hint: &str,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.), egui::Sense::click());
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), hint));
-    let hovered = response.hovered();
-    if hovered || active {
-        ui.painter().rect_filled(
-            rect,
-            CornerRadius::same(7),
-            if active { p.accent_soft } else { p.card_hover },
-        );
-    }
-    let c = rect.center();
-    let stroke = egui::Stroke::new(
-        1.4,
-        if active || hovered {
-            p.accent
-        } else {
-            p.text_dim
-        },
-    );
-    let painter = ui.painter();
-    let line = |a: [f32; 2], b: [f32; 2]| {
-        painter.line_segment([c + Vec2::from(a), c + Vec2::from(b)], stroke);
-    };
-    match icon {
-        "pin" => {
-            line([-3., -6.], [3., -6.]);
-            line([-2., -6.], [-2., -1.]);
-            line([2., -6.], [2., -1.]);
-            line([-2., -1.], [-5., 2.]);
-            line([2., -1.], [5., 2.]);
-            line([-5., 2.], [5., 2.]);
-            line([0., 2.], [0., 7.]);
-        }
-        "sun" | "settings" => {
-            painter.circle_stroke(c, if icon == "sun" { 3. } else { 4.5 }, stroke);
-            if icon == "settings" {
-                painter.circle_stroke(c, 1.5, stroke);
-            }
-            for i in 0..8 {
-                let v = Vec2::angled(i as f32 * std::f32::consts::TAU / 8.);
-                painter.line_segment([c + v * 5.5, c + v * 7.], stroke);
-            }
-        }
-        "moon" => {
-            painter.add(egui::Shape::line(
-                vec![
-                    c + Vec2::new(2., -6.),
-                    c + Vec2::new(-2., -5.),
-                    c + Vec2::new(-5., -1.),
-                    c + Vec2::new(-4., 4.),
-                    c + Vec2::new(0., 6.),
-                    c + Vec2::new(5., 4.),
-                    c + Vec2::new(1., 3.),
-                    c + Vec2::new(-1., 0.),
-                    c + Vec2::new(0., -4.),
-                    c + Vec2::new(2., -6.),
-                ],
-                stroke,
-            ));
-        }
-        _ => {}
-    }
-    response.on_hover_text(hint)
-}
-/// Keyboard-hint chip used in the footer (`kbd` look).
-fn kbd(ui: &mut egui::Ui, p: &Palette, label: &str) {
-    egui::Frame::default()
-        .fill(p.card)
-        .stroke(egui::Stroke::new(1., p.border))
-        .corner_radius(CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(5, 1))
-        .show(ui, |ui| {
-            ui.label(mono(label).size(9.5).color(p.text_dim));
-        });
-}
-/// Amber toggle switch for settings rows; returns true when the value changed.
-fn toggle(ui: &mut egui::Ui, p: &Palette, value: &mut bool, hint: &str) -> bool {
-    let (rect, mut response) = ui.allocate_exact_size(Vec2::new(36., 20.), egui::Sense::click());
-    let mut changed = false;
-    if response.clicked() {
-        *value = !*value;
-        response.mark_changed();
-        changed = true;
-    }
-    let t = ui.ctx().animate_bool_with_time(response.id, *value, 0.15);
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(10), mix(p.border, p.accent, t));
-    let r = 7.;
-    let cx = rect.left() + 3. + r + t * (rect.width() - 6. - 2. * r);
-    ui.painter().circle_filled(
-        egui::Pos2::new(cx, rect.center().y),
-        r,
-        mix(p.text_dim, p.on_accent, t),
-    );
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), hint));
-    if !hint.is_empty() {
-        response.on_hover_text(hint);
-    }
-    changed
-}
-/// − value + stepper used for numeric settings.
-fn stepper<T>(ui: &mut egui::Ui, p: &Palette, value: &mut T, min: T, max: T, step: T)
-where
-    T: Copy
-        + PartialOrd
-        + std::ops::Add<Output = T>
-        + std::ops::Sub<Output = T>
-        + std::fmt::Display,
-{
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.;
-        for (label, sign) in [("−", -1i8), ("+", 1)] {
-            let button = ui.add(
-                egui::Button::new(mono(label).size(12.).color(p.text_dim))
-                    .fill(p.input)
-                    .stroke(egui::Stroke::new(1., p.border))
-                    .corner_radius(CornerRadius::same(6))
-                    .min_size(Vec2::splat(22.)),
-            );
-            if button.clicked() {
-                let next = if sign < 0 {
-                    *value - step
-                } else {
-                    *value + step
-                };
-                if next < min {
-                    *value = min;
-                } else if next > max {
-                    *value = max;
-                } else {
-                    *value = next;
-                }
-            }
-            if sign < 0 {
-                ui.add_sized(
-                    Vec2::new(56., 22.),
-                    egui::Label::new(mono(format!("{value}")).size(12.).color(p.text))
-                        .halign(egui::Align::Center),
-                );
-            }
-        }
-    });
-}
-/// Grouped card with a small caps header, matching the settings redesign.
-fn settings_card(ui: &mut egui::Ui, p: &Palette, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::default()
-        .fill(p.card)
-        .stroke(egui::Stroke::new(1., p.hairline))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(egui::Margin::same(0))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            egui::Frame::default()
-                .inner_margin(egui::Margin::symmetric(14, 10))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(mono(title).size(11.).strong().color(p.text_dim));
-                });
-            ui.painter().hline(
-                ui.available_rect_before_wrap().x_range(),
-                ui.cursor().top(),
-                egui::Stroke::new(1., p.hairline),
-            );
-            add(ui);
-        });
-    ui.add_space(14.);
-}
-/// Hairline between rows inside a settings card.
-fn card_divider(ui: &mut egui::Ui, p: &Palette) {
-    ui.painter().hline(
-        ui.available_rect_before_wrap().x_range(),
-        ui.cursor().top(),
-        egui::Stroke::new(1., p.hairline),
-    );
-}
-/// Settings row: label + description on the left, control on the right.
-fn setting_row(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    title: &str,
-    desc: &str,
-    control: impl FnOnce(&mut egui::Ui),
-) {
-    egui::Frame::default()
-        .inner_margin(egui::Margin::symmetric(14, 11))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_width((ui.available_width() - 170.).max(200.));
-                    ui.label(RichText::new(title).size(12.8).color(p.text));
-                    if !desc.is_empty() {
-                        ui.label(RichText::new(desc).size(10.8).color(p.text_dim));
-                    }
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    control(ui);
-                });
-            });
-        });
-}
-/// Settings left-nav row: self-drawn icon + label, accent highlight when active.
-fn settings_nav_item(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    section: SettingsSection,
-    active: bool,
-) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.), egui::Sense::click());
-    if active {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(7), p.accent_soft);
-    } else if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(7), p.card_hover);
-    }
-    let color = if active { p.accent } else { p.text_dim };
-    let icon = egui::Rect::from_center_size(
-        egui::Pos2::new(rect.left() + 16., rect.center().y),
-        Vec2::splat(14.),
-    );
-    let stroke = egui::Stroke::new(1.3, color);
-    let c = icon.center();
-    match section {
-        SettingsSection::General => {
-            ui.painter().circle_stroke(c, 3.6, stroke);
-            for i in 0..4 {
-                let a = std::f32::consts::FRAC_PI_4 + i as f32 * std::f32::consts::FRAC_PI_2;
-                let dir = egui::Vec2::new(a.cos(), a.sin());
-                ui.painter()
-                    .line_segment([c + dir * 5., c + dir * 6.8], stroke);
-            }
-        }
-        SettingsSection::Clipboard => {
-            ui.painter().rect_stroke(
-                icon.shrink(2.),
-                CornerRadius::same(3),
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-            ui.painter().line_segment(
-                [
-                    egui::Pos2::new(icon.left() + 4., c.y - 1.5),
-                    egui::Pos2::new(icon.right() - 4., c.y - 1.5),
-                ],
-                stroke,
-            );
-            ui.painter().line_segment(
-                [
-                    egui::Pos2::new(icon.left() + 4., c.y + 2.),
-                    egui::Pos2::new(icon.right() - 4., c.y + 2.),
-                ],
-                stroke,
-            );
-        }
-        SettingsSection::Launcher => {
-            ui.painter().line_segment(
-                [
-                    egui::Pos2::new(icon.left() + 3.5, icon.top() + 2.),
-                    egui::Pos2::new(icon.right() - 2.5, c.y),
-                ],
-                stroke,
-            );
-            ui.painter().line_segment(
-                [
-                    egui::Pos2::new(icon.right() - 2.5, c.y),
-                    egui::Pos2::new(icon.left() + 3.5, icon.bottom() - 2.),
-                ],
-                stroke,
-            );
-            ui.painter().line_segment(
-                [
-                    egui::Pos2::new(icon.left() + 3.5, icon.top() + 2.),
-                    egui::Pos2::new(icon.left() + 3.5, icon.bottom() - 2.),
-                ],
-                stroke,
-            );
-        }
-        SettingsSection::Hotkeys => {
-            ui.painter().rect_stroke(
-                icon.shrink(1.5),
-                CornerRadius::same(3),
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-            for i in -1..=1 {
-                ui.painter()
-                    .circle_filled(c + egui::Vec2::new(i as f32 * 3.6, 0.), 0.9, color);
-            }
-        }
-        SettingsSection::Data => {
-            let top = egui::Rect::from_center_size(
-                egui::Pos2::new(c.x, icon.top() + 3.),
-                Vec2::new(10., 4.6),
-            );
-            ui.painter().line_segment(
-                [
-                    top.left_bottom(),
-                    top.left_bottom() + egui::Vec2::new(0., 7.6),
-                ],
-                stroke,
-            );
-            ui.painter().line_segment(
-                [
-                    top.right_bottom(),
-                    top.right_bottom() + egui::Vec2::new(0., 7.6),
-                ],
-                stroke,
-            );
-            ui.painter()
-                .circle_stroke(egui::Pos2::new(c.x, icon.top() + 3.), 5., stroke);
-            ui.painter().line_segment(
-                [
-                    egui::Pos2::new(icon.left() + 2., icon.bottom() - 2.4),
-                    egui::Pos2::new(icon.right() - 2., icon.bottom() - 2.4),
-                ],
-                stroke,
-            );
-        }
-    }
-    ui.painter().text(
-        egui::Pos2::new(rect.left() + 30., rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        section.label(),
-        egui::FontId::proportional(12.5),
-        if active { p.accent } else { p.text },
-    );
-    response
 }
 /// egui logical key → physical code accepted by the hotkey registrar.
 fn key_code(key: egui::Key) -> Option<Code> {
@@ -1572,6 +768,39 @@ fn consume_local_shortcut(ctx: &egui::Context, raw: &str) -> bool {
 }
 
 impl App {
+    /// 面板激活时生效的页面快捷键（JSON / 时间戳），返回 true 表示本帧已消费按键。
+    fn consume_page_shortcuts(&mut self, ctx: &egui::Context) -> bool {
+        if self.hotkey_capture.is_some() || self.ime_composing {
+            return false;
+        }
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
+        if !focused {
+            return false;
+        }
+        let settings = self.backend.store.lock().unwrap().settings.clone();
+        for (raw, json) in [
+            (&settings.hotkeys.json, true),
+            (&settings.hotkeys.timestamp, false),
+        ] {
+            if !raw.is_empty() && consume_local_shortcut(ctx, raw) {
+                self.calculator.leave();
+                self.launcher.active = false;
+                self.json.active = json;
+                self.timestamp.active = !json;
+                self.settings_open = false;
+                self.confirm = None;
+                self.enlarged_image = None;
+                if json {
+                    self.json.find_open = false;
+                    self.json.history_open = false;
+                }
+                self.focus_search = true;
+                self.dirty = true;
+                return true;
+            }
+        }
+        false
+    }
     fn consume_find_shortcut(&self, ctx: &egui::Context) -> bool {
         if self.hotkey_capture.is_some() || self.ime_composing {
             return false;
@@ -1582,7 +811,8 @@ impl App {
             .lock()
             .unwrap()
             .settings
-            .find_hotkey
+            .hotkeys
+            .find
             .clone();
         consume_local_shortcut(ctx, &shortcut)
     }
@@ -1907,6 +1137,15 @@ fn time_label(copied_at: i64) -> String {
 }
 
 impl App {
+    /// 预览抽屉的统一写入路径：设置开关与 Ctrl+P 都走这里，改动立即持久化，
+    /// 呼出面板时不会回到旧状态。
+    fn set_preview(&mut self, open: bool) {
+        self.preview_open = open;
+        self.preview_default = open;
+        if let Ok(dir) = backend::data_dir() {
+            UiState::of(self).save(&dir);
+        }
+    }
     fn hide(&mut self, ctx: &egui::Context) {
         if self._tray.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -2140,7 +1379,7 @@ impl App {
         self.memberships = memberships;
         self.preview_is_image = is_image;
         if is_image {
-            // 选中图片行时自动展开预览抽屉，直接看到大图。
+            // 图片行始终自动展开预览抽屉，直接看到大图；下次呼出面板时按偏好复位。
             self.preview_open = true;
             if let Some(texture) = self.thumbs.get(&selected).cloned() {
                 self.texture = Some(texture);
@@ -2218,7 +1457,7 @@ impl App {
                 icon: "▸",
                 name: "启动器",
                 desc: "搜索应用、文件、书签与网页",
-                meta: pretty_hotkey(&settings.launcher_hotkey),
+                meta: pretty_hotkey(&settings.hotkeys.launcher),
             },
             CommandItem {
                 id: "settings",
@@ -2229,7 +1468,11 @@ impl App {
             },
             pause,
         ];
-        let filter = self.query.trim_start_matches('>').trim().to_lowercase();
+        let filter = self
+            .query
+            .trim_start_matches(['>', '＞'])
+            .trim()
+            .to_lowercase();
         if filter.is_empty() {
             return all;
         }
@@ -2762,11 +2005,14 @@ impl App {
             return;
         }
         let hotkey = HotKey::new(Some(mods), code);
+        let hotkeys = &self.settings.hotkeys;
         let conflict = [
-            (HotkeySlot::Show, &self.settings.hotkey),
-            (HotkeySlot::Queue, &self.settings.queue_hotkey),
-            (HotkeySlot::Find, &self.settings.find_hotkey),
-            (HotkeySlot::Launcher, &self.settings.launcher_hotkey),
+            (HotkeySlot::Show, &hotkeys.summon),
+            (HotkeySlot::Queue, &hotkeys.queue),
+            (HotkeySlot::Find, &hotkeys.find),
+            (HotkeySlot::Launcher, &hotkeys.launcher),
+            (HotkeySlot::Json, &hotkeys.json),
+            (HotkeySlot::Timestamp, &hotkeys.timestamp),
         ]
         .iter()
         .any(|(other_slot, other)| {
@@ -2776,11 +2022,14 @@ impl App {
             self.capture_error = "与另一个快捷键相同".into();
             return;
         }
+        let hotkeys = &mut self.settings.hotkeys;
         match slot {
-            HotkeySlot::Show => self.settings.hotkey = hotkey.to_string(),
-            HotkeySlot::Queue => self.settings.queue_hotkey = hotkey.to_string(),
-            HotkeySlot::Find => self.settings.find_hotkey = hotkey.to_string(),
-            HotkeySlot::Launcher => self.settings.launcher_hotkey = hotkey.to_string(),
+            HotkeySlot::Show => hotkeys.summon = hotkey.to_string(),
+            HotkeySlot::Queue => hotkeys.queue = hotkey.to_string(),
+            HotkeySlot::Find => hotkeys.find = hotkey.to_string(),
+            HotkeySlot::Launcher => hotkeys.launcher = hotkey.to_string(),
+            HotkeySlot::Json => hotkeys.json = hotkey.to_string(),
+            HotkeySlot::Timestamp => hotkeys.timestamp = hotkey.to_string(),
         }
         self.hotkey_capture = None;
         self.capture_error.clear();
@@ -2858,6 +2107,10 @@ fn resize_border(ctx: &egui::Context) {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        Color32::TRANSPARENT.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if let Some(started) = self.smoke {
             let screenshot = ctx.input(|i| {
@@ -2916,6 +2169,13 @@ impl eframe::App for App {
         }
         self.backend.window.store(self.owner, Ordering::Relaxed);
         self.drain_images(ctx);
+        // 无边框主窗口：在透明背景上绘制圆角底色，让剪贴板、启动器、JSON、
+        // 时间戳各页面与设置窗口保持一致的圆角。
+        ctx.layer_painter(egui::LayerId::background()).rect_filled(
+            ctx.content_rect(),
+            CornerRadius::same(APP_CORNER_RADIUS),
+            palette(self.dark, self.theme).panel,
+        );
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::OpenJson
@@ -2969,11 +2229,11 @@ impl eframe::App for App {
                         self.target = target;
                     }
                     self.backend.visible.store(true, Ordering::Relaxed);
+                    // 呼出剪贴板时始终回到剪贴板页：退出启动器、JSON、时间戳等页面。
                     self.launcher.active = false;
+                    self.timestamp.active = false;
+                    self.json.active = false;
                     if queue {
-                        self.launcher.active = false;
-                        self.timestamp.active = false;
-                        self.json.active = false;
                         self.calculator.leave();
                     }
                     if !self.calculator.active {
@@ -2995,6 +2255,8 @@ impl eframe::App for App {
                     self.dirty = true;
                     self.focus_search = true;
                     self.was_focused = false;
+                    // 呼出剪贴板时预览回到持久偏好；图片选中导致的临时展开不会延续。
+                    self.preview_open = self.preview_default;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -3012,6 +2274,17 @@ impl eframe::App for App {
             resize_border(ctx);
         }
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
+        // 面板激活时生效的 JSON / 时间戳快捷键，在所有页面的按键处理之前消费。
+        if focused
+            && !self.settings_open
+            && self.confirm.is_none()
+            && self.enlarged_image.is_none()
+            && !self.launcher.managing()
+            && self.consume_page_shortcuts(ctx)
+        {
+            ctx.request_repaint();
+            return;
+        }
         if self.launcher.active
             && self.was_focused
             && !focused
@@ -3086,13 +2359,13 @@ impl eframe::App for App {
             && !self.ime_composing
             && consume_local_shortcut(ctx, "Ctrl+P")
         {
-            self.preview_open = !self.preview_open;
+            self.set_preview(!self.preview_open);
         }
         let mut navigation_active = false;
         egui::TopBottomPanel::top("header")
             .frame(
                 egui::Frame::NONE
-                    .fill(palette(self.dark, self.theme).panel)
+                    .fill(Color32::TRANSPARENT)
                     .inner_margin(egui::Margin::symmetric(14, 6)),
             )
             .show(ctx, |ui| {
@@ -3106,7 +2379,7 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
             ui.add_space(6.);
-            let command_mode = self.query.starts_with('>');
+            let command_mode = self.query.starts_with(['>', '＞']);
             let search = ui
                 .horizontal(|ui| {
                     ui.label(
@@ -3132,7 +2405,7 @@ impl eframe::App for App {
                         self.dark = !self.dark;
                         apply_theme(ctx, self.dark, self.theme);
                         if let Ok(dir) = backend::data_dir() {
-                            UiState { dark: self.dark, theme: self.theme }.save(&dir);
+                            UiState::of(self).save(&dir);
                         }
                     }
                     if ghost_icon(ui, &p, "settings", self.settings_open, "偏好设置").clicked() {
@@ -3315,7 +2588,7 @@ impl eframe::App for App {
                     0
                 }
             });
-            if self.query.starts_with('>') {
+            if self.query.starts_with(['>', '＞']) {
                 // 命令模式：↑↓ 在工具列表中移动，Enter 执行。
                 let commands = self.command_items();
                 if delta != 0 && !commands.is_empty() {
@@ -3355,7 +2628,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::NONE
-                    .fill(palette(self.dark, self.theme).panel)
+                    .fill(Color32::TRANSPARENT)
                     .inner_margin(egui::Margin::symmetric(14, 6)),
             )
             .show(ctx, |ui| {
@@ -3434,303 +2707,311 @@ impl eframe::App for App {
         {
             self.enlarge_image(ctx);
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_enabled_ui(!busy && !modal, |ui| {
-                if self.query.starts_with('>') {
-                    self.command_page(ui);
-                    return;
-                }
-                let drawer_w = if self.preview_open { 260. } else { 0. };
-                let list_w = (ui.available_width() - drawer_w).max(120.);
-                // 注意：横向布局里 available_height() 不可靠（cursor 高度为 0），先取好。
-                let panel_h = ui.available_height();
-                ui.horizontal(|ui| {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(list_w, panel_h),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            if self.items.is_empty() {
-                                ui.add_space(80.);
-                                ui.centered_and_justified(|ui| {
-                                    ui.vertical(|ui| {
-                                        ui.centered_and_justified(|ui| {
-                                            ui.label(
-                                                mono(if self.filter == "queue" {
-                                                    "还没有待粘贴的内容"
-                                                } else {
-                                                    "—— 没有匹配的记录 ——"
-                                                })
-                                                .size(13.)
-                                                .color(palette(self.dark, self.theme).text_dim),
-                                            );
-                                        });
-                                        ui.add_space(6.);
-                                        ui.centered_and_justified(|ui| {
-                                            ui.label(
-                                                RichText::new(if self.filter == "queue" {
-                                                    "点击「返回添加」，再点记录左侧 + 加入排列"
-                                                } else {
-                                                    "开启记录后，在其他应用复制内容"
-                                                })
-                                                .size(11.5)
-                                                .color(palette(self.dark, self.theme).text_dim),
-                                            );
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT))
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(!busy && !modal, |ui| {
+                    if self.query.starts_with(['>', '＞']) {
+                        self.command_page(ui);
+                        return;
+                    }
+                    let drawer_w = if self.preview_open { 260. } else { 0. };
+                    let list_w = (ui.available_width() - drawer_w).max(120.);
+                    // 注意：横向布局里 available_height() 不可靠（cursor 高度为 0），先取好。
+                    let panel_h = ui.available_height();
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(list_w, panel_h),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                if self.items.is_empty() {
+                                    ui.add_space(80.);
+                                    ui.centered_and_justified(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.centered_and_justified(|ui| {
+                                                ui.label(
+                                                    mono(if self.filter == "queue" {
+                                                        "还没有待粘贴的内容"
+                                                    } else {
+                                                        "—— 没有匹配的记录 ——"
+                                                    })
+                                                    .size(13.)
+                                                    .color(palette(self.dark, self.theme).text_dim),
+                                                );
+                                            });
+                                            ui.add_space(6.);
+                                            ui.centered_and_justified(|ui| {
+                                                ui.label(
+                                                    RichText::new(if self.filter == "queue" {
+                                                        "点击「返回添加」，再点记录左侧 + 加入排列"
+                                                    } else {
+                                                        "开启记录后，在其他应用复制内容"
+                                                    })
+                                                    .size(11.5)
+                                                    .color(palette(self.dark, self.theme).text_dim),
+                                                );
+                                            });
                                         });
                                     });
-                                });
-                                return;
-                            }
-                            if self.history_up_distance > 140.
-                                && self.history_offset > ROW_STEP * 3.
-                            {
-                                ui.horizontal(|ui| {
-                                    if ui.button("↑ 回到顶部").clicked() {
-                                        self.history_top = true;
-                                        self.history_up_distance = 0.;
-                                        self.scroll_selected = false;
-                                    }
-                                });
-                            }
-                            let mut area = egui::ScrollArea::vertical()
-                                .id_salt("history")
-                                .auto_shrink([false, false]);
-                            if self.scroll_selected {
-                                if let Some(index) =
-                                    self.items.iter().position(|e| e.id == self.selected)
-                                {
-                                    area = area.vertical_scroll_offset(index as f32 * ROW_STEP);
+                                    return;
                                 }
-                                self.scroll_selected = false;
-                            }
-                            if self.history_top {
-                                area = area.vertical_scroll_offset(0.);
-                                self.history_top = false;
-                            }
-                            let items = std::mem::take(&mut self.items);
-                            self.thumb_budget = THUMB_BUDGET;
-                            let history_scroll =
-                                area.show_rows(ui, ROW_HEIGHT, items.len(), |ui, range| {
-                                    let p = palette(self.dark, self.theme);
-                                    for index in range {
-                                        let item = &items[index];
-                                        ui.horizontal(|ui| {
-                                            let in_queue = self.filter == "queue";
-                                            let queued = self
-                                                .backend
-                                                .store
-                                                .lock()
-                                                .unwrap()
-                                                .organizer
-                                                .queue
-                                                .contains(&item.id);
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        mono(if queued { "−" } else { "+" })
-                                                            .color(p.accent),
-                                                    )
-                                                    .fill(if queued {
-                                                        p.accent_soft
-                                                    } else {
-                                                        Color32::TRANSPARENT
-                                                    })
-                                                    .min_size(Vec2::new(24., 24.)),
-                                                )
-                                                .on_hover_text(if queued {
-                                                    "已加入排列，点击移除"
-                                                } else {
-                                                    "加入排列粘贴"
-                                                })
-                                                .clicked()
-                                            {
-                                                let id = item.id.clone();
-                                                self.operation(|s| {
-                                                    let mut q = s.organizer.queue.clone();
-                                                    if q.contains(&id) {
-                                                        q.retain(|v| v != &id);
-                                                    } else {
-                                                        q.push(id);
-                                                    }
-                                                    s.queue(q)
-                                                });
-                                            }
-                                            let width = ui.available_width()
-                                                - if in_queue { 64. } else { 0. };
-                                            let (rect, response) = ui.allocate_exact_size(
-                                                Vec2::new(width, ROW_HEIGHT),
-                                                egui::Sense::click(),
-                                            );
-                                            let selected = item.id == self.selected;
-                                            let hover = ui.ctx().animate_bool_with_time(
-                                                egui::Id::new(("row-hover", &item.id)),
-                                                response.hovered(),
-                                                0.08,
-                                            );
-                                            let fill = if selected {
-                                                p.card_selected
-                                            } else {
-                                                mix(p.card, p.card_hover, hover)
-                                            };
-                                            let border = if selected {
-                                                p.accent
-                                            } else {
-                                                mix(p.hairline, p.accent, hover * 0.6)
-                                            };
-                                            // Paint the card, then draw contents on top in a child UI.
-                                            let corner = CornerRadius::same(5);
-                                            ui.painter()
-                                                .add(egui::Shape::rect_filled(rect, corner, fill));
-                                            if selected {
-                                                ui.painter().add(egui::Shape::rect_filled(
-                                                    egui::Rect::from_min_size(
-                                                        rect.min + egui::vec2(1.5, 1.5),
-                                                        egui::vec2(3., rect.height() - 3.),
-                                                    ),
-                                                    CornerRadius {
-                                                        nw: 2,
-                                                        ne: 0,
-                                                        se: 0,
-                                                        sw: 2,
-                                                    },
-                                                    p.accent,
-                                                ));
-                                            }
-                                            ui.painter().add(egui::Shape::rect_stroke(
-                                                rect,
-                                                corner,
-                                                egui::Stroke::new(1., border),
-                                                egui::StrokeKind::Inside,
-                                            ));
-                                            let mut card = ui.new_child(
-                                                egui::UiBuilder::new()
-                                                    .id_salt(egui::Id::new(&item.id))
-                                                    .max_rect(rect.shrink2(Vec2::new(12., 6.))),
-                                            );
-                                            card.horizontal_top(|ui| {
-                                                if item.kind == "image" {
-                                                    self.row_thumbnail(ui, item);
-                                                }
-                                                ui.vertical(|ui| {
-                                                    ui.add_space(1.);
-                                                    ui.horizontal(|ui| {
-                                                        if item.pinned {
-                                                            ui.label(
-                                                                RichText::new("★").color(p.star),
-                                                            );
-                                                        }
-                                                        let summary = item
-                                                            .preview
-                                                            .split_whitespace()
-                                                            .collect::<Vec<_>>()
-                                                            .join(" ");
-                                                        let mut title: String =
-                                                            summary.chars().take(75).collect();
-                                                        if summary.chars().count() > 75 {
-                                                            title.push('…');
-                                                        }
-                                                        ui.add(
-                                                            egui::Label::new(
-                                                                RichText::new(title)
-                                                                    .strong()
-                                                                    .color(p.text),
-                                                            )
-                                                            .truncate(),
-                                                        );
-                                                    });
-                                                    ui.horizontal(|ui| {
-                                                        let kind = match item.kind.as_str() {
-                                                            "image" => "IMG",
-                                                            "link" => "URL",
-                                                            _ => "TXT",
-                                                        };
-                                                        kind_tag(ui, &p, kind);
-                                                        if !item.source.is_empty() {
-                                                            ui.label(
-                                                                RichText::new(&item.source)
-                                                                    .small()
-                                                                    .color(p.text_dim),
-                                                            );
-                                                        }
-                                                        ui.with_layout(
-                                                            egui::Layout::right_to_left(
-                                                                egui::Align::Center,
-                                                            ),
-                                                            |ui| {
-                                                                ui.label(
-                                                                    mono(time_label(
-                                                                        item.copied_at,
-                                                                    ))
-                                                                    .size(10.5)
-                                                                    .color(p.text_dim),
-                                                                );
-                                                                if selected {
-                                                                    ui.add_space(8.);
-                                                                    ui.label(
-                                                                        mono("⏎ 粘贴")
-                                                                            .size(10.5)
-                                                                            .strong()
-                                                                            .color(p.accent),
-                                                                    );
-                                                                }
-                                                            },
-                                                        );
-                                                    });
-                                                });
-                                            });
-                                            if response.clicked() {
-                                                self.selected = item.id.clone();
-                                            }
-                                            if response.double_clicked() {
-                                                self.selected = item.id.clone();
-                                                self.apply(true, false, false);
-                                            }
-                                            if in_queue {
-                                                for (label, delta) in [("↑", -1isize), ("↓", 1)]
-                                                {
-                                                    if ui
-                                                        .small_button(mono(label).color(p.text_dim))
-                                                        .clicked()
-                                                    {
-                                                        let id = item.id.clone();
-                                                        self.operation(|s| {
-                                                            let mut q = s.organizer.queue.clone();
-                                                            if let Some(i) =
-                                                                q.iter().position(|v| v == &id)
-                                                            {
-                                                                let j = i as isize + delta;
-                                                                if j >= 0 && (j as usize) < q.len()
-                                                                {
-                                                                    q.swap(i, j as usize);
-                                                                }
-                                                            }
-                                                            s.queue(q)
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        });
+                                if self.history_up_distance > 140.
+                                    && self.history_offset > ROW_STEP * 3.
+                                {
+                                    ui.horizontal(|ui| {
+                                        if ui.button("↑ 回到顶部").clicked() {
+                                            self.history_top = true;
+                                            self.history_up_distance = 0.;
+                                            self.scroll_selected = false;
+                                        }
+                                    });
+                                }
+                                let mut area = egui::ScrollArea::vertical()
+                                    .id_salt("history")
+                                    .auto_shrink([false, false]);
+                                if self.scroll_selected {
+                                    if let Some(index) =
+                                        self.items.iter().position(|e| e.id == self.selected)
+                                    {
+                                        area = area.vertical_scroll_offset(index as f32 * ROW_STEP);
                                     }
-                                });
-                            let offset = history_scroll.state.offset.y;
-                            let delta = self.history_offset - offset;
-                            if delta > 0. {
-                                self.history_up_distance += delta;
-                            } else if delta < -1. {
-                                self.history_up_distance = 0.;
-                            }
-                            if offset < 1. {
-                                self.history_up_distance = 0.;
-                            }
-                            self.history_offset = offset;
-                            self.items = items;
-                        },
-                    );
-                    if self.preview_open {
-                        self.preview_drawer(ui, panel_h);
-                    }
+                                    self.scroll_selected = false;
+                                }
+                                if self.history_top {
+                                    area = area.vertical_scroll_offset(0.);
+                                    self.history_top = false;
+                                }
+                                let items = std::mem::take(&mut self.items);
+                                self.thumb_budget = THUMB_BUDGET;
+                                let history_scroll =
+                                    area.show_rows(ui, ROW_HEIGHT, items.len(), |ui, range| {
+                                        let p = palette(self.dark, self.theme);
+                                        for index in range {
+                                            let item = &items[index];
+                                            ui.horizontal(|ui| {
+                                                let in_queue = self.filter == "queue";
+                                                let queued = self
+                                                    .backend
+                                                    .store
+                                                    .lock()
+                                                    .unwrap()
+                                                    .organizer
+                                                    .queue
+                                                    .contains(&item.id);
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            mono(if queued { "−" } else { "+" })
+                                                                .color(p.accent),
+                                                        )
+                                                        .fill(if queued {
+                                                            p.accent_soft
+                                                        } else {
+                                                            Color32::TRANSPARENT
+                                                        })
+                                                        .min_size(Vec2::new(24., 24.)),
+                                                    )
+                                                    .on_hover_text(if queued {
+                                                        "已加入排列，点击移除"
+                                                    } else {
+                                                        "加入排列粘贴"
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    let id = item.id.clone();
+                                                    self.operation(|s| {
+                                                        let mut q = s.organizer.queue.clone();
+                                                        if q.contains(&id) {
+                                                            q.retain(|v| v != &id);
+                                                        } else {
+                                                            q.push(id);
+                                                        }
+                                                        s.queue(q)
+                                                    });
+                                                }
+                                                let width = ui.available_width()
+                                                    - if in_queue { 64. } else { 0. };
+                                                let (rect, response) = ui.allocate_exact_size(
+                                                    Vec2::new(width, ROW_HEIGHT),
+                                                    egui::Sense::click(),
+                                                );
+                                                let selected = item.id == self.selected;
+                                                let hover = ui.ctx().animate_bool_with_time(
+                                                    egui::Id::new(("row-hover", &item.id)),
+                                                    response.hovered(),
+                                                    0.08,
+                                                );
+                                                let fill = if selected {
+                                                    p.card_selected
+                                                } else {
+                                                    mix(p.card, p.card_hover, hover)
+                                                };
+                                                let border = if selected {
+                                                    p.accent
+                                                } else {
+                                                    mix(p.hairline, p.accent, hover * 0.6)
+                                                };
+                                                // Paint the card, then draw contents on top in a child UI.
+                                                let corner = CornerRadius::same(5);
+                                                ui.painter().add(egui::Shape::rect_filled(
+                                                    rect, corner, fill,
+                                                ));
+                                                if selected {
+                                                    ui.painter().add(egui::Shape::rect_filled(
+                                                        egui::Rect::from_min_size(
+                                                            rect.min + egui::vec2(1.5, 1.5),
+                                                            egui::vec2(3., rect.height() - 3.),
+                                                        ),
+                                                        CornerRadius {
+                                                            nw: 2,
+                                                            ne: 0,
+                                                            se: 0,
+                                                            sw: 2,
+                                                        },
+                                                        p.accent,
+                                                    ));
+                                                }
+                                                ui.painter().add(egui::Shape::rect_stroke(
+                                                    rect,
+                                                    corner,
+                                                    egui::Stroke::new(1., border),
+                                                    egui::StrokeKind::Inside,
+                                                ));
+                                                let mut card = ui.new_child(
+                                                    egui::UiBuilder::new()
+                                                        .id_salt(egui::Id::new(&item.id))
+                                                        .max_rect(rect.shrink2(Vec2::new(12., 6.))),
+                                                );
+                                                card.horizontal_top(|ui| {
+                                                    if item.kind == "image" {
+                                                        self.row_thumbnail(ui, item);
+                                                    }
+                                                    ui.vertical(|ui| {
+                                                        ui.add_space(1.);
+                                                        ui.horizontal(|ui| {
+                                                            if item.pinned {
+                                                                ui.label(
+                                                                    RichText::new("★")
+                                                                        .color(p.star),
+                                                                );
+                                                            }
+                                                            let summary = item
+                                                                .preview
+                                                                .split_whitespace()
+                                                                .collect::<Vec<_>>()
+                                                                .join(" ");
+                                                            let mut title: String =
+                                                                summary.chars().take(75).collect();
+                                                            if summary.chars().count() > 75 {
+                                                                title.push('…');
+                                                            }
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    RichText::new(title)
+                                                                        .strong()
+                                                                        .color(p.text),
+                                                                )
+                                                                .truncate(),
+                                                            );
+                                                        });
+                                                        ui.horizontal(|ui| {
+                                                            let kind = match item.kind.as_str() {
+                                                                "image" => "IMG",
+                                                                "link" => "URL",
+                                                                _ => "TXT",
+                                                            };
+                                                            kind_tag(ui, &p, kind);
+                                                            if !item.source.is_empty() {
+                                                                ui.label(
+                                                                    RichText::new(&item.source)
+                                                                        .small()
+                                                                        .color(p.text_dim),
+                                                                );
+                                                            }
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(
+                                                                    egui::Align::Center,
+                                                                ),
+                                                                |ui| {
+                                                                    ui.label(
+                                                                        mono(time_label(
+                                                                            item.copied_at,
+                                                                        ))
+                                                                        .size(10.5)
+                                                                        .color(p.text_dim),
+                                                                    );
+                                                                    if selected {
+                                                                        ui.add_space(8.);
+                                                                        ui.label(
+                                                                            mono("⏎ 粘贴")
+                                                                                .size(10.5)
+                                                                                .strong()
+                                                                                .color(p.accent),
+                                                                        );
+                                                                    }
+                                                                },
+                                                            );
+                                                        });
+                                                    });
+                                                });
+                                                if response.clicked() {
+                                                    self.selected = item.id.clone();
+                                                }
+                                                if response.double_clicked() {
+                                                    self.selected = item.id.clone();
+                                                    self.apply(true, false, false);
+                                                }
+                                                if in_queue {
+                                                    for (label, delta) in [("↑", -1isize), ("↓", 1)]
+                                                    {
+                                                        if ui
+                                                            .small_button(
+                                                                mono(label).color(p.text_dim),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            let id = item.id.clone();
+                                                            self.operation(|s| {
+                                                                let mut q =
+                                                                    s.organizer.queue.clone();
+                                                                if let Some(i) =
+                                                                    q.iter().position(|v| v == &id)
+                                                                {
+                                                                    let j = i as isize + delta;
+                                                                    if j >= 0
+                                                                        && (j as usize) < q.len()
+                                                                    {
+                                                                        q.swap(i, j as usize);
+                                                                    }
+                                                                }
+                                                                s.queue(q)
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    });
+                                let offset = history_scroll.state.offset.y;
+                                let delta = self.history_offset - offset;
+                                if delta > 0. {
+                                    self.history_up_distance += delta;
+                                } else if delta < -1. {
+                                    self.history_up_distance = 0.;
+                                }
+                                if offset < 1. {
+                                    self.history_up_distance = 0.;
+                                }
+                                self.history_offset = offset;
+                                self.items = items;
+                            },
+                        );
+                        if self.preview_open {
+                            self.preview_drawer(ui, panel_h);
+                        }
+                    });
                 });
             });
-        });
         if self.settings_open {
             self.capture_hotkey(ctx);
         } else {
@@ -3810,7 +3091,8 @@ impl App {
                     egui::Frame::window(&ctx.style())
                         .fill(palette(self.dark, self.theme).panel)
                         .stroke(egui::Stroke::new(1., palette(self.dark, self.theme).border))
-                        .corner_radius(CornerRadius::same(14))
+                        .corner_radius(CornerRadius::same(APP_CORNER_RADIUS))
+                        .shadow(egui::Shadow::NONE)
                         .inner_margin(egui::Margin::same(0)),
                 )
                 .resizable(false)
@@ -3825,10 +3107,10 @@ impl App {
                         ui.painter().rect_filled(
                             nav_rect,
                             CornerRadius {
-                                nw: 14,
+                                nw: APP_CORNER_RADIUS,
                                 ne: 0,
                                 se: 0,
-                                sw: 14,
+                                sw: APP_CORNER_RADIUS,
                             },
                             p.card,
                         );
@@ -3972,33 +3254,58 @@ impl App {
                                         })
                                         .show(ui, |ui| {
                                             ui.set_width(ui.available_width());
-                                            ui.label(
-                                                RichText::new(self.settings_section.label())
-                                                    .size(16.)
-                                                    .strong()
-                                                    .color(p.text),
-                                            );
-                                            ui.label(
-                                                RichText::new(match self.settings_section {
-                                                    SettingsSection::General => {
-                                                        "启动、外观与记录开关"
-                                                    }
-                                                    SettingsSection::Clipboard => {
-                                                        "采集策略与历史保留"
-                                                    }
-                                                    SettingsSection::Launcher => {
-                                                        "搜索范围与指令前缀"
-                                                    }
-                                                    SettingsSection::Hotkeys => {
-                                                        "点击「重录」后按下新组合键；需包含 Ctrl 或 Alt，Windows 不支持 Win 键"
-                                                    }
-                                                    SettingsSection::Data => {
-                                                        "本地加密存储，备份保存在数据目录"
-                                                    }
-                                                })
-                                                .size(11.5)
-                                                .color(p.text_dim),
-                                            );
+                                            ui.horizontal(|ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.set_width(
+                                                        (ui.available_width() - 40.).max(200.),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(
+                                                            self.settings_section.label(),
+                                                        )
+                                                        .size(16.)
+                                                        .strong()
+                                                        .color(p.text),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(match self.settings_section {
+                                                            SettingsSection::General => {
+                                                                "启动、外观与记录开关"
+                                                            }
+                                                            SettingsSection::Clipboard => {
+                                                                "采集策略与历史保留"
+                                                            }
+                                                            SettingsSection::Launcher => {
+                                                                "搜索范围与指令前缀"
+                                                            }
+                                                            SettingsSection::Hotkeys => {
+                                                                "点击「重录」后按下新组合键；需包含 Ctrl 或 Alt，Windows 不支持 Win 键"
+                                                            }
+                                                            SettingsSection::Data => {
+                                                                "本地加密存储，备份保存在数据目录"
+                                                            }
+                                                        })
+                                                        .size(11.5)
+                                                        .color(p.text_dim),
+                                                    );
+                                                });
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        if icon_button(
+                                                            ui,
+                                                            &p,
+                                                            "close",
+                                                            false,
+                                                            "关闭设置",
+                                                        )
+                                                        .clicked()
+                                                        {
+                                                            open = false;
+                                                        }
+                                                    },
+                                                );
+                                            });
                                             ui.add_space(16.);
                                             match self.settings_section {
                             SettingsSection::General => {
@@ -4035,7 +3342,7 @@ impl App {
                                                 self.theme = theme;
                                                 apply_theme(ui.ctx(), self.dark, self.theme);
                                                 if let Ok(dir) = backend::data_dir() {
-                                                    UiState { dark: self.dark, theme: self.theme }.save(&dir);
+                                                    UiState::of(self).save(&dir);
                                                 }
                                             }
                                             ui.add_space(6.);
@@ -4049,7 +3356,7 @@ impl App {
                                             self.dark = false;
                                             apply_theme(ui.ctx(), self.dark, self.theme);
                                             if let Ok(dir) = backend::data_dir() {
-                                                UiState { dark: self.dark, theme: self.theme }.save(&dir);
+                                                UiState::of(self).save(&dir);
                                             }
                                         }
                                         ui.add_space(6.);
@@ -4059,10 +3366,23 @@ impl App {
                                             self.dark = true;
                                             apply_theme(ui.ctx(), self.dark, self.theme);
                                             if let Ok(dir) = backend::data_dir() {
-                                                UiState { dark: self.dark, theme: self.theme }.save(&dir);
+                                                UiState::of(self).save(&dir);
                                             }
                                         }
                                     });
+                                    card_divider(ui, &p);
+                                    setting_row(
+                                        ui,
+                                        &p,
+                                        "预览面板",
+                                        "关闭后不再默认展开预览抽屉，仍可用 Ctrl+P 切换",
+                                        |ui| {
+                                            let mut value = self.preview_open;
+                                            if toggle(ui, &p, &mut value, "") {
+                                                self.set_preview(value);
+                                            }
+                                        },
+                                    );
                                 });
                                 settings_card(ui, &p, "记录", |ui| {
                                     setting_row(
@@ -4416,26 +3736,42 @@ impl App {
                                     (
                                         "全局快捷键",
                                         vec![
-                                            (HotkeySlot::Show, "呼出面板", self.settings.hotkey.clone()),
+                                            (
+                                                HotkeySlot::Show,
+                                                "呼出面板",
+                                                self.settings.hotkeys.summon.clone(),
+                                            ),
                                             (
                                                 HotkeySlot::Queue,
                                                 "排列粘贴",
-                                                self.settings.queue_hotkey.clone(),
+                                                self.settings.hotkeys.queue.clone(),
                                             ),
                                             (
                                                 HotkeySlot::Launcher,
                                                 "启动器",
-                                                self.settings.launcher_hotkey.clone(),
+                                                self.settings.hotkeys.launcher.clone(),
                                             ),
                                         ],
                                     ),
                                     (
                                         "面板内",
-                                        vec![(
-                                            HotkeySlot::Find,
-                                            "查找",
-                                            self.settings.find_hotkey.clone(),
-                                        )],
+                                        vec![
+                                            (
+                                                HotkeySlot::Find,
+                                                "查找",
+                                                self.settings.hotkeys.find.clone(),
+                                            ),
+                                            (
+                                                HotkeySlot::Json,
+                                                "JSON 工作页",
+                                                self.settings.hotkeys.json.clone(),
+                                            ),
+                                            (
+                                                HotkeySlot::Timestamp,
+                                                "时间戳转换",
+                                                self.settings.hotkeys.timestamp.clone(),
+                                            ),
+                                        ],
                                     ),
                                 ] {
                                     settings_card(ui, &p, card, |ui| {
@@ -4446,7 +3782,7 @@ impl App {
                                                 card_divider(ui, &p);
                                             }
                                             let active = self.hotkey_capture == Some(*slot);
-                                            setting_row(ui, &p, label, "", |ui| {
+                                            setting_row_sized(ui, &p, label, "", 280., |ui| {
                                                 let text = if active {
                                                     pending_hotkey_label(ui.ctx())
                                                 } else if value.is_empty() {
@@ -4462,7 +3798,7 @@ impl App {
                                                             p.text
                                                         }),
                                                     )
-                                                    .min_size(Vec2::new(120., 24.))
+                                                    .min_size(Vec2::new(150., 24.))
                                                     .fill(if active {
                                                         p.accent_soft
                                                     } else {
@@ -4479,6 +3815,7 @@ impl App {
                                                         if active { None } else { Some(*slot) };
                                                     self.capture_error.clear();
                                                 }
+                                                ui.add_space(14.);
                                                 if ghost(ui, "重录").clicked() {
                                                     self.hotkey_capture = Some(*slot);
                                                     self.capture_error.clear();
@@ -4579,10 +3916,6 @@ impl App {
                                                     if primary(ui, &p, "保存设置").clicked() {
                                                         self.save_settings();
                                                     }
-                                                    ui.add_space(10.);
-                                                    if ghost(ui, "关闭").clicked() {
-                                                        open = false;
-                                                    }
                                                 },
                                             );
                                         });
@@ -4674,9 +4007,9 @@ mod tests {
         let mut settings = Settings::default();
         let keys = hotkey_specs(&settings).unwrap();
         assert_eq!(keys[2].1, HotKey::new(Some(HotkeyMods::ALT), Code::KeyS));
-        settings.launcher_hotkey = settings.hotkey.clone();
+        settings.hotkeys.launcher = settings.hotkeys.summon.clone();
         assert!(hotkey_specs(&settings).is_err());
-        settings.launcher_hotkey = "invalid hotkey".into();
+        settings.hotkeys.launcher = "invalid hotkey".into();
         assert!(hotkey_specs(&settings).is_err());
     }
 
@@ -4727,7 +4060,7 @@ mod tests {
     #[test]
     fn default_show_hotkey_is_ctrl_shift_v() {
         // 默认呼出快捷键；必须能解析注册并正确显示。
-        let default = Settings::default().hotkey;
+        let default = Settings::default().hotkeys.summon;
         assert_eq!(
             HotKey::from_str(&default).unwrap(),
             HotKey::new(Some(HotkeyMods::CONTROL | HotkeyMods::SHIFT), Code::KeyV)

@@ -16,11 +16,11 @@ pub(super) struct JsonPage {
     collapsed: HashSet<String>,
     all_closed: bool,
     elapsed_ms: f64,
-    find_open: bool,
+    pub find_open: bool,
     find_text: String,
     find_index: usize,
     find_scroll: bool,
-    history_open: bool,
+    pub history_open: bool,
     history_tab: usize,
     history_items: Vec<JsonHistoryView>,
     history_error: String,
@@ -378,7 +378,7 @@ impl App {
         egui::TopBottomPanel::top("json-history-header")
             .frame(
                 egui::Frame::NONE
-                    .fill(p.panel)
+                    .fill(Color32::TRANSPARENT)
                     .inner_margin(egui::Margin::symmetric(20, 16)),
             )
             .show(ctx, |ui| {
@@ -491,7 +491,7 @@ impl App {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
-                    .fill(p.panel)
+                    .fill(Color32::TRANSPARENT)
                     .inner_margin(egui::Margin::symmetric(20, 16)),
             )
             .show(ctx, |ui| {
@@ -639,7 +639,7 @@ impl App {
         egui::TopBottomPanel::top("json-header")
             .frame(
                 egui::Frame::NONE
-                    .fill(p.panel)
+                    .fill(Color32::TRANSPARENT)
                     .inner_margin(egui::Margin::symmetric(20, 14)),
             )
             .show(ctx, |ui| {
@@ -792,7 +792,7 @@ impl App {
         egui::TopBottomPanel::bottom("json-status")
             .frame(
                 egui::Frame::NONE
-                    .fill(p.panel)
+                    .fill(Color32::TRANSPARENT)
                     .inner_margin(egui::Margin::symmetric(20, 10)),
             )
             .show(ctx, |ui| {
@@ -831,7 +831,7 @@ impl App {
                     });
                 });
             });
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(p.panel).inner_margin(12)).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::TRANSPARENT).inner_margin(12)).show(ctx, |ui| {
             let height = ui.available_height();
             ui.spacing_mut().item_spacing.x = 12.;
             ui.columns(2, |columns| {

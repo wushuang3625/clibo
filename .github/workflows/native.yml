@@ -19,5 +19,4 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check --manifest-path native/Cargo.toml
       - run: cargo check --locked --manifest-path native/Cargo.toml
-      - if: runner.os == 'Windows'
-        run: cargo test --locked --manifest-path native/Cargo.toml
+      - run: cargo test --locked --manifest-path native/Cargo.toml

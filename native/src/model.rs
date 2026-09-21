@@ -79,10 +79,61 @@ impl LauncherSearchPrefixes {
     }
 }
 
+/// 全部快捷键集中在一个结构里管理。
+///
+/// 序列化仍沿用 0.6.x 及更早版本的扁平键名（`hotkey`、`queueHotkey` …），
+/// 旧版本写出的设置无需迁移即可被直接读取，降级回旧版本也能识别这些键。
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct Hotkeys {
+    /// 呼出 / 隐藏主面板（全局）。
+    #[serde(rename = "hotkey")]
+    pub summon: String,
+    /// 排列粘贴（全局）。
+    #[serde(rename = "queueHotkey")]
+    pub queue: String,
+    /// 面板内查找（面板激活时生效）。
+    #[serde(rename = "findHotkey")]
+    pub find: String,
+    /// JSON 工作页（面板激活时生效，默认未设置）。
+    #[serde(rename = "jsonHotkey")]
+    pub json: String,
+    /// 时间戳转换（面板激活时生效，默认未设置）。
+    #[serde(rename = "timestampHotkey")]
+    pub timestamp: String,
+    /// 呼出启动器（全局）。
+    #[serde(rename = "launcherHotkey")]
+    pub launcher: String,
+}
+impl Default for Hotkeys {
+    fn default() -> Self {
+        Self {
+            summon: "Ctrl+Shift+V".into(),
+            queue: "Ctrl+Alt+Q".into(),
+            find: "Ctrl+F".into(),
+            // 面板激活时生效，默认未设置，可在偏好设置中录入。
+            json: String::new(),
+            timestamp: String::new(),
+            launcher: "Alt+S".into(),
+        }
+    }
+}
+impl Hotkeys {
+    /// 需要全局注册的快捷键（名称用于冲突 / 格式错误提示）。
+    pub fn global(&self) -> [(&'static str, &String); 3] {
+        [
+            ("呼出面板", &self.summon),
+            ("排列粘贴", &self.queue),
+            ("启动器", &self.launcher),
+        ]
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
-    pub launcher_hotkey: String,
+    #[serde(flatten)]
+    pub hotkeys: Hotkeys,
     pub launcher_recent: Vec<String>,
     pub launcher_roots: Vec<String>,
     pub launcher_bookmarks: bool,
@@ -95,15 +146,12 @@ pub struct Settings {
     pub retention_days: i64,
     pub json_history_max_items: usize,
     pub excluded_apps: Vec<String>,
-    pub hotkey: String,
-    pub queue_hotkey: String,
-    pub find_hotkey: String,
     pub autostart: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            launcher_hotkey: "Alt+S".into(),
+            hotkeys: Hotkeys::default(),
             launcher_recent: Vec::new(),
             launcher_roots: Vec::new(),
             launcher_bookmarks: true,
@@ -130,9 +178,6 @@ impl Default for Settings {
                     "bitwarden.exe".into(),
                 ]
             },
-            hotkey: "Ctrl+Shift+V".into(),
-            queue_hotkey: "Ctrl+Alt+Q".into(),
-            find_hotkey: "Ctrl+F".into(),
             autostart: false,
         }
     }
@@ -309,15 +354,40 @@ mod tests {
     #[test]
     fn old_settings_keep_primary_shortcut_and_default_queue_shortcut() {
         let settings: Settings = serde_json::from_str(r#"{"hotkey":"Ctrl+Shift+V"}"#).unwrap();
-        assert_eq!(settings.hotkey, "Ctrl+Shift+V");
-        assert_eq!(settings.queue_hotkey, "Ctrl+Alt+Q");
-        assert_eq!(settings.find_hotkey, "Ctrl+F");
+        assert_eq!(settings.hotkeys.summon, "Ctrl+Shift+V");
+        assert_eq!(settings.hotkeys.queue, "Ctrl+Alt+Q");
+        assert_eq!(settings.hotkeys.find, "Ctrl+F");
         assert_eq!(settings.json_history_max_items, 100);
         let mut custom = settings;
-        custom.find_hotkey = "Ctrl+Shift+F".into();
+        custom.hotkeys.find = "Ctrl+Shift+F".into();
         let restored: Settings =
             serde_json::from_str(&serde_json::to_string(&custom).unwrap()).unwrap();
-        assert_eq!(restored.find_hotkey, "Ctrl+Shift+F");
+        assert_eq!(restored.hotkeys.find, "Ctrl+Shift+F");
+    }
+    #[test]
+    fn hotkeys_use_the_same_flat_wire_keys_as_before_the_grouping() {
+        // 0.6.x 写出的扁平键名必须原样读入，且重新写出的 JSON 键名保持不变，
+        // 这样旧库无需迁移、降级回旧版本也不会丢失自定义快捷键。
+        let legacy =
+            r#"{"hotkey":"Ctrl+Alt+K","queueHotkey":"Ctrl+Alt+Q","findHotkey":"Ctrl+Shift+F","jsonHotkey":"Ctrl+J","timestampHotkey":"Ctrl+T","launcherHotkey":"Alt+Space"}"#;
+        let settings: Settings = serde_json::from_str(legacy).unwrap();
+        assert_eq!(settings.hotkeys.summon, "Ctrl+Alt+K");
+        assert_eq!(settings.hotkeys.queue, "Ctrl+Alt+Q");
+        assert_eq!(settings.hotkeys.find, "Ctrl+Shift+F");
+        assert_eq!(settings.hotkeys.json, "Ctrl+J");
+        assert_eq!(settings.hotkeys.timestamp, "Ctrl+T");
+        assert_eq!(settings.hotkeys.launcher, "Alt+Space");
+        let rewritten = serde_json::to_string(&settings).unwrap();
+        for key in [
+            "\"hotkey\":\"Ctrl+Alt+K\"",
+            "\"queueHotkey\":\"Ctrl+Alt+Q\"",
+            "\"findHotkey\":\"Ctrl+Shift+F\"",
+            "\"jsonHotkey\":\"Ctrl+J\"",
+            "\"timestampHotkey\":\"Ctrl+T\"",
+            "\"launcherHotkey\":\"Alt+Space\"",
+        ] {
+            assert!(rewritten.contains(key), "{rewritten} 缺少 {key}");
+        }
     }
     #[test]
     fn legacy_saved_queues_field_is_ignored() {

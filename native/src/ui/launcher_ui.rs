@@ -64,7 +64,11 @@ impl Worker {
                             icons.clear();
                         }
                         #[cfg(windows)]
-                        let rgba = launcher::windows::icon(Path::new(&target));
+                        let rgba = if launcher::is_app_reference(&target) {
+                            launcher::windows::apps_folder_icon(&target)
+                        } else {
+                            launcher::windows::icon(Path::new(&target))
+                        };
                         #[cfg(not(windows))]
                         let rgba = None;
                         icons.insert(target.clone(), rgba);
@@ -226,7 +230,7 @@ impl LauncherPage {
             return false;
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(Vec2::new(620., 440.)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(Vec2::new(560., 440.)));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(original.size()));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(original.min));
         self.size = None;
@@ -536,7 +540,11 @@ impl App {
         let mut copy = None;
         let mut remove = None;
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(bg).inner_margin(12))
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(12),
+            )
             .show(ctx, |ui| {
                 ui.visuals_mut().override_text_color = Some(text);
                 ui.visuals_mut().selection.bg_fill = p.accent_soft;
@@ -936,7 +944,7 @@ impl App {
                     ui.label(
                         RichText::new(format!(
                             "{} · {} 个结果",
-                            pretty_hotkey(&self.settings.launcher_hotkey),
+                            pretty_hotkey(&self.settings.hotkeys.launcher),
                             self.launcher.rows.len()
                         ))
                         .size(10.)

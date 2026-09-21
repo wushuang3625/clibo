@@ -192,9 +192,9 @@ impl Store {
         // v1-v3 使用 Ctrl+Alt+V 作为默认呼出键。仅在旧库升级到 v4 时迁移一次；
         // v4 之后用户主动改回 Ctrl+Alt+V 必须保持不变。
         if (1..CURRENT_DB_VERSION).contains(&version)
-            && settings.hotkey.eq_ignore_ascii_case("Ctrl+Alt+V")
+            && settings.hotkeys.summon.eq_ignore_ascii_case("Ctrl+Alt+V")
         {
-            settings.hotkey = "Ctrl+Shift+V".into();
+            settings.hotkeys.summon = "Ctrl+Shift+V".into();
             let bytes = serde_json::to_vec(&settings).map_err(|_| "设置序列化失败".to_string())?;
             let sealed = crypto::protect(&bytes)?;
             db.execute(
@@ -1277,7 +1277,7 @@ mod tests {
         s.insert(clip("legacy content")).unwrap();
         let id = s.entries[0].view.id.clone();
         let mut settings = s.settings.clone();
-        settings.hotkey = "Ctrl+Shift+V".into();
+        settings.hotkeys.summon = "Ctrl+Shift+V".into();
         s.save_settings(settings).unwrap();
         let mut old = serde_json::to_value(s.secret(&id).unwrap()).unwrap();
         old.as_object_mut().unwrap().remove("note");
@@ -1289,7 +1289,7 @@ mod tests {
             .unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.settings.hotkey, "Ctrl+Shift+V");
+        assert_eq!(s.settings.hotkeys.summon, "Ctrl+Shift+V");
         assert_eq!(
             s.secret(&id).unwrap().text.as_deref(),
             Some("legacy content")
@@ -1303,18 +1303,18 @@ mod tests {
         let path = dir.path().join("hotkey.db");
         let mut s = Store::open(&path).unwrap();
         let mut settings = s.settings.clone();
-        settings.hotkey = "Ctrl+Alt+V".into();
+        settings.hotkeys.summon = "Ctrl+Alt+V".into();
         s.save_settings(settings).unwrap();
         s.db.execute_batch("PRAGMA user_version=3;").unwrap();
         drop(s);
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.settings.hotkey, "Ctrl+Shift+V");
+        assert_eq!(s.settings.hotkeys.summon, "Ctrl+Shift+V");
         let mut user_choice = s.settings.clone();
-        user_choice.hotkey = "Ctrl+Alt+V".into();
+        user_choice.hotkeys.summon = "Ctrl+Alt+V".into();
         s.save_settings(user_choice).unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.settings.hotkey, "Ctrl+Alt+V");
+        assert_eq!(s.settings.hotkeys.summon, "Ctrl+Alt+V");
     }
     #[test]
     fn current_database_preserves_user_selected_legacy_hotkey() {
@@ -1322,11 +1322,11 @@ mod tests {
         let path = dir.path().join("current-hotkey.db");
         let mut s = Store::open(&path).unwrap();
         let mut settings = s.settings.clone();
-        settings.hotkey = "Ctrl+Alt+V".into();
+        settings.hotkeys.summon = "Ctrl+Alt+V".into();
         s.save_settings(settings).unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.settings.hotkey, "Ctrl+Alt+V");
+        assert_eq!(s.settings.hotkeys.summon, "Ctrl+Alt+V");
     }
     #[test]
     fn custom_hotkey_survives_default_migration() {
@@ -1334,11 +1334,11 @@ mod tests {
         let path = dir.path().join("hotkey.db");
         let mut s = Store::open(&path).unwrap();
         let mut settings = s.settings.clone();
-        settings.hotkey = "Ctrl+Alt+K".into();
+        settings.hotkeys.summon = "Ctrl+Alt+K".into();
         s.save_settings(settings).unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.settings.hotkey, "Ctrl+Alt+K");
+        assert_eq!(s.settings.hotkeys.summon, "Ctrl+Alt+K");
     }
     #[test]
     fn restart_dedup_pin_and_encryption() {
@@ -1456,7 +1456,7 @@ mod tests {
         assert!(backup.exists());
         s.insert(clip("after-backup")).unwrap();
         let mut settings = s.settings.clone();
-        settings.hotkey = "Ctrl+Alt+K".into();
+        settings.hotkeys.summon = "Ctrl+Alt+K".into();
         s.save_settings(settings).unwrap();
         let restored = s.restore_latest_history_backup().unwrap();
         assert_eq!(restored, backup);
@@ -1465,7 +1465,7 @@ mod tests {
             s.secret(&s.entries[0].view.id).unwrap().text.as_deref(),
             Some("before-backup")
         );
-        assert_eq!(s.settings.hotkey, "Ctrl+Alt+K");
+        assert_eq!(s.settings.hotkeys.summon, "Ctrl+Alt+K");
         assert!(std::fs::read_dir(dir.path()).unwrap().any(|entry| {
             entry
                 .unwrap()

@@ -274,6 +274,42 @@ pub fn search_with_prefixes(
     prefixes: &LauncherSearchPrefixes,
     input: &str,
 ) -> Results {
+    // `>` 或全角 `》` 进入工具模式，只列出 Clibo 内置工具，类似剪贴板面板的命令模式。
+    let tools_input = input.trim_start();
+    let tools_input = tools_input
+        .strip_prefix('>')
+        .or_else(|| tools_input.strip_prefix('》'));
+    if let Some(tools_query) = tools_input.map(str::trim) {
+        let mut result = Results::default();
+        for (title, keywords, builtin) in [
+            ("剪贴板历史", "clipboard history", Builtin::Clipboard),
+            ("JSON 工作页", "json format", Builtin::Json),
+            ("时间戳转换", "timestamp time", Builtin::Timestamp),
+            (
+                "Clibo 偏好设置",
+                "settings preferences",
+                Builtin::Preferences,
+            ),
+            ("刷新启动器索引", "refresh reload", Builtin::Refresh),
+        ] {
+            if let Some(s) = score(&title.to_lowercase(), keywords, &tools_query.to_lowercase()) {
+                result.rows.push(Row {
+                    title: title.into(),
+                    subtitle: "Clibo 工具 · Enter 执行".into(),
+                    kind: Kind::Tool,
+                    action: Action::Builtin(builtin),
+                    custom: None,
+                    score: s + 200,
+                });
+            }
+        }
+        result.rows.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then(a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+        });
+        return result;
+    }
     let raw = input.trim();
     let lower = input.trim_start().to_lowercase();
     let (mode, query) = match lower.split_once(' ') {
@@ -741,6 +777,34 @@ mod tests {
         let result = search(&catalog, &[], &[], "sys shutdown");
         assert_eq!(result.rows[0].action, Action::Builtin(Builtin::Shutdown));
         assert!(Builtin::Shutdown.requires_confirmation());
+    }
+    #[test]
+    fn gt_prefix_lists_builtin_tools_only() {
+        let catalog = Catalog {
+            items: vec![Indexed::new(
+                Entry {
+                    name: "微信".into(),
+                    target: "C:/Apps/WeChat.exe".into(),
+                },
+                Kind::App,
+                "应用",
+            )],
+            ..Catalog::default()
+        };
+        // `>` 列出全部工具且不混入应用，全角 `》` 与过滤词同样生效。
+        let results = search(&catalog, &[], &[], ">");
+        assert_eq!(results.rows.len(), 5);
+        assert!(results
+            .rows
+            .iter()
+            .all(|row| matches!(row.action, Action::Builtin(_)) && row.kind == Kind::Tool));
+        let results = search(&catalog, &[], &[], "》json");
+        assert_eq!(results.rows.len(), 1);
+        assert_eq!(results.rows[0].action, Action::Builtin(Builtin::Json));
+        let results = search(&catalog, &[], &[], "> 时间戳");
+        assert_eq!(results.rows.len(), 1);
+        assert_eq!(results.rows[0].action, Action::Builtin(Builtin::Timestamp));
+        assert!(search(&catalog, &[], &[], "> 不存在").rows.is_empty());
     }
     #[test]
     fn paths_with_spaces_return_actual_file() {

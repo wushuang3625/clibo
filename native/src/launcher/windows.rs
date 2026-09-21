@@ -1,4 +1,5 @@
-//! Windows integration stays local: shell opening, known folders and icon extraction.
+//! Windows integration stays local: shell opening, known folders, packaged
+//! (Microsoft Store) app enumeration / activation and icon extraction.
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use windows_sys::core::{GUID, PWSTR};
